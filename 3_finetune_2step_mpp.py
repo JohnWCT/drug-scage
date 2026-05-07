@@ -35,6 +35,7 @@ import gc
 import itertools
 import json
 import os
+import shutil
 import sys
 from pathlib import Path
 from typing import Dict
@@ -89,6 +90,8 @@ def parse_args():
     parser.add_argument("--hidden_dim", type=int, default=256)
     parser.add_argument("--layer_num", type=int, default=6)
     parser.add_argument("--num_heads", type=int, default=16)
+    parser.add_argument("--minimal_outputs", type=int, default=1, choices=[0, 1],
+                        help="1: keep model.pth + config_finetune.yaml + learning_curve.png + record.txt")
     return parser.parse_args()
 
 
@@ -535,7 +538,7 @@ class CustomTrainer(upstream.Trainer):
     def train(self):
         write_record(self.txtfile, self.config)
         self.net = self.net.to("cuda")
-        mode = "higher"
+        mode = "lower"
         stopper_tmp_path = os.path.join(self.writer.log_dir, "_early_stop_tmp.pth")
         stopper = EarlyStopping(mode=mode, patience=GlobalVar.patience, filename=stopper_tmp_path)
 
@@ -564,6 +567,23 @@ class CustomTrainer(upstream.Trainer):
             unit="epoch",
             dynamic_ncols=True,
         )
+        if self.config.get("eval_before_train", True):
+            valid_loss0, valid_metric0, valid_parts0, valid_metrics0 = self._valid_step(
+                self.val_loader,
+                "valid_epoch0_loaded_checkpoint",
+            )
+            test_loss0, test_metric0, test_parts0, test_metrics0 = self._valid_step(
+                self.test_loader,
+                "test_epoch0_loaded_checkpoint",
+            )
+            write_record(
+                self.txtfile,
+                f"epoch:0_loaded_checkpoint\n"
+                f"valid_loss:{valid_loss0} test_loss:{test_loss0}\n"
+                f"valid_metric:{valid_metric0} test_metric:{test_metric0}\n"
+                f"valid_metrics:{valid_metrics0} test_metrics:{test_metrics0}\n"
+                f"valid_loss_parts:{valid_parts0} test_loss_parts:{test_parts0}",
+            )
         for i in epoch_progress:
             if self.config["lr_scheduler"]["type"] in ["cos", "square", "linear"]:
                 self.lr_scheduler.adjust_lr(self.optim, i)
@@ -596,7 +616,7 @@ class CustomTrainer(upstream.Trainer):
                 self._save_best_model()
                 write_record(self.txtfile, f"best_model_updated epoch:{best_epoch} path:{best_model_path}")
 
-            if stopper.step(valid_select_metric, self.net, test_score=test_select_metric):
+            if stopper.step(valid_loss, self.net, test_score=test_loss):
                 stopper.report_final_results(i_epoch=i)
                 break
 
@@ -796,6 +816,7 @@ def build_config(base_args, trial, trainable_scope, checkpoint):
     config["regression_label_transform"] = trial.get("regression_label_transform", "none")
     config["encoder_lr_ratio"] = trial.get("encoder_lr_ratio", 1.0)
     config["max_grad_norm"] = trial.get("max_grad_norm", 0.0)
+    config["eval_before_train"] = trial.get("eval_before_train", True)
     config["pretrain_model_path"] = "None"
     config = get_downstream_task_names(config)
     set_seed(config["seed"])
@@ -840,6 +861,18 @@ def run_training(base_args, trial, trainable_scope, checkpoint):
             f"Training finished but no best checkpoint was saved: {model_path}. "
             "Check the stage record.txt for non-finite validation metrics."
         )
+    if int(base_args.minimal_outputs) == 1:
+        keep_names = {"model.pth", "config_finetune.yaml", "learning_curve.png", "record.txt"}
+        for artifact in Path(model_path).parent.iterdir():
+            if artifact.name in keep_names:
+                continue
+            if artifact.is_dir():
+                shutil.rmtree(artifact, ignore_errors=True)
+            else:
+                try:
+                    artifact.unlink()
+                except FileNotFoundError:
+                    pass
     return model_path
 
 
@@ -864,9 +897,18 @@ def build_trials(cfg, default_dist_bar):
         "stage2_patience": two_stage.get("stage2_patience", fixed.get("patience", 30)),
         "scheduler_type": fixed.get("scheduler_type", "None"),
         "regression_label_transform": fixed.get("regression_label_transform", "none"),
-        "encoder_lr_ratio": fixed.get("encoder_lr_ratio", 1.0),
+        "encoder_lr_ratio": fixed.get("encoder_lr_ratio", 0.05),
+        "max_grad_norm": fixed.get("max_grad_norm", 1.0),
+        "eval_before_train": fixed.get("eval_before_train", True),
         "stage2_warmup_epochs": two_stage.get("stage2_warmup_epochs", fixed.get("warm_up_epoch", 5)),
-        "stage2_loss_weights": fixed.get("stage2_loss_weights", None),
+        "stage1_loss_weights": fixed.get(
+            "stage1_loss_weights",
+            {"graph": 1.0, "finger": 0.0, "atom_fg": 0.0},
+        ),
+        "stage2_loss_weights": fixed.get(
+            "stage2_loss_weights",
+            {"graph": 1.0, "finger": 0.0, "atom_fg": 0.0},
+        ),
         "dist_bar": fixed.get("dist_bar", default_dist_bar),
     }
     grids = {key: as_list(search.get(key), base[key]) for key in base if key != "dist_bar"}
@@ -882,7 +924,6 @@ def build_trials(cfg, default_dist_bar):
             f"_db{'-'.join(str(x) for x in item['dist_bar'])}"
         ).replace(".", "p")
         item["run_tag_base"] = tag
-        item["loss_weights"] = fixed.get("loss_weights")
         trials.append(item)
     return trials
 
@@ -970,7 +1011,13 @@ def main():
                 "trial_dir": str(trial_dir),
                 "trial_serial": idx,
                 "stage_name": "single",
-                "loss_weights": trial_cfg.get("loss_weights"),
+                "loss_weights": trial_cfg.get(
+                    "stage2_loss_weights",
+                    {"graph": 1.0, "finger": 0.0, "atom_fg": 0.0},
+                ),
+                "encoder_lr_ratio": trial_cfg.get("encoder_lr_ratio", 0.05),
+                "max_grad_norm": trial_cfg.get("max_grad_norm", 1.0),
+                "eval_before_train": trial_cfg.get("eval_before_train", True),
                 "regression_label_transform": trial_cfg.get("regression_label_transform", "none"),
                 "dist_bar": trial_cfg["dist_bar"],
             }
@@ -996,7 +1043,13 @@ def main():
                 "trial_dir": str(trial_dir),
                 "trial_serial": idx,
                 "stage_name": "stage1",
-                "loss_weights": {"graph": 1.0, "finger": 0.0, "atom_fg": 0.0},
+                "loss_weights": trial_cfg.get(
+                    "stage1_loss_weights",
+                    {"graph": 1.0, "finger": 0.0, "atom_fg": 0.0},
+                ),
+                "encoder_lr_ratio": trial_cfg.get("encoder_lr_ratio", 0.05),
+                "max_grad_norm": trial_cfg.get("max_grad_norm", 1.0),
+                "eval_before_train": trial_cfg.get("eval_before_train", True),
                 "regression_label_transform": trial_cfg.get("regression_label_transform", "none"),
                 "dist_bar": trial_cfg["dist_bar"],
             }
@@ -1035,7 +1088,13 @@ def main():
                 "trial_dir": str(trial_dir),
                 "trial_serial": idx,
                 "stage_name": "stage2",
-                "loss_weights": trial_cfg.get("loss_weights"),
+                "loss_weights": trial_cfg.get(
+                    "stage2_loss_weights",
+                    {"graph": 1.0, "finger": 0.0, "atom_fg": 0.0},
+                ),
+                "encoder_lr_ratio": trial_cfg.get("encoder_lr_ratio", 0.05),
+                "max_grad_norm": trial_cfg.get("max_grad_norm", 1.0),
+                "eval_before_train": trial_cfg.get("eval_before_train", True),
                 "regression_label_transform": trial_cfg.get("regression_label_transform", "none"),
                 "dist_bar": trial_cfg["dist_bar"],
             }

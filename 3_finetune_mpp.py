@@ -21,6 +21,7 @@ Example:
 """
 
 import argparse
+import shutil
 import sys
 from pathlib import Path
 
@@ -60,7 +61,31 @@ def parse_args():
     parser.add_argument("--gpus", type=str, default="0")
     parser.add_argument("--ckpt", type=str, default="pretrain",
                         help="Pretrain checkpoint name used by finetune_mpp.py, e.g. pretrain or None")
+    parser.add_argument("--minimal_outputs", type=int, default=1, choices=[0, 1],
+                        help="1: keep model.pth + config_finetune.yaml + learning_curve.png + record.txt")
     return parser.parse_args()
+
+
+def finetune_log_dir(args) -> Path:
+    run_name = f"{args.task}_{args.seed}_{args.split_type}_{args.lr}_{args.batch_size}"
+    return Path("finetune_result") / run_name
+
+
+def prune_stage_outputs(log_dir: Path):
+    model_path = log_dir / "model.pth"
+    if not model_path.exists():
+        return
+    keep_names = {"model.pth", "config_finetune.yaml", "learning_curve.png", "record.txt"}
+    for artifact in log_dir.iterdir():
+        if artifact.name in keep_names:
+            continue
+        if artifact.is_dir():
+            shutil.rmtree(artifact, ignore_errors=True)
+        else:
+            try:
+                artifact.unlink()
+            except FileNotFoundError:
+                pass
 
 
 def main():
@@ -96,6 +121,8 @@ def main():
     ]
 
     run_cmd(cmd, cwd=project_root)
+    if int(args.minimal_outputs) == 1:
+        prune_stage_outputs(project_root / finetune_log_dir(args))
 
 
 if __name__ == "__main__":

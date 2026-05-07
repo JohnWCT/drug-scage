@@ -14,10 +14,23 @@ gpus: "0"
 fixed:
   seed: 8
   batch_size: 32
+  dropout: 0.1
+  weight_decay: 1.0e-4
   optim_type: adam
   warm_up_epoch: 10
   start_lr: 1.0e-5
   init_base_lr: 1.0e-4
+  encoder_lr_ratio: 0.05
+  max_grad_norm: 1.0
+  eval_before_train: true
+  stage1_loss_weights:
+    graph: 1.0
+    finger: 0.0
+    atom_fg: 0.0
+  stage2_loss_weights:
+    graph: 1.0
+    finger: 0.0
+    atom_fg: 0.0
 
 # 每個 key 都可以填 scalar 或 list；list 會做 Cartesian product 暴力搜尋。
 # 會生效：以下每個 key 都會被 build_trials() 展開並傳入訓練。
