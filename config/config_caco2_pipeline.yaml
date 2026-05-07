@@ -1,0 +1,47 @@
+task_name: caco2
+# target_col 可省略，程式會自動從 _config.py 的 task_configs 推斷
+target_col: null
+input_csv: ./data/mpp/custom/caco2.csv
+raw_dir: ./data/mpp/raw
+pkl_dir: ./data/mpp/pkl
+split_root: ./data/mpp
+result_dir: ./outputs/caco2_pipeline
+
+split_type: random_scaffold
+seed: 8
+gpus: "0"
+num_cores: 16
+smiles_timeout_sec: 60
+dataloader_num_workers: 0
+pin_memory: false
+
+# Finetune 參數：先回到 config_finetune.yaml 較穩的預設，再用 3_finetune_2step_mpp.py 做 grid search。
+batch_size: 16
+epochs: 120
+patience: 25
+save_ckpt: 1
+dropout: 0.1
+ckpt: pretrain
+
+optim:
+  type: adam
+  init_lr: 5.0e-5
+  weight_decay: 1.0e-4
+
+lr_scheduler:
+  type: None
+  warm_up_epoch: 5
+
+# 3_finetune_2step_mpp.py 預設使用兩階段訓練：
+# stage1 只訓練 head_Graph，stage2 載入 stage1 best model 後解凍全模型。
+two_stage:
+  stage1_epochs: 20
+  stage1_patience: 10
+  stage1_lr: 5.0e-5
+  stage2_epochs: 120
+  stage2_patience: 25
+  stage2_lr: 5.0e-5
+
+# 暴力搜尋可以直接用 CLI 覆寫，例如：
+# --stage2_lr_grid 5e-5,2e-5,1e-5 --dropout_grid 0.1,0.2 --weight_decay_grid 1e-4,5e-4
+search: {}

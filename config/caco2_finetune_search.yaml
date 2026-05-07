@@ -1,0 +1,43 @@
+# 會生效：控制任務、資料與切分方式。
+task: caco2
+dataroot: ./data/mpp/pkl
+splitroot: ./data/mpp/split
+split_type: random_scaffold
+
+# 會生效，但只影響輸出位置，不影響模型參數或訓練結果。
+result_dir: ./outputs/caco2_pipeline
+
+# 會生效：控制使用哪張 GPU；不改變模型結構。
+gpus: "0"
+
+# fixed: 只放「不在 search 中變動」且你要固定的參數。
+fixed:
+  seed: 8
+  batch_size: 32
+  optim_type: adam
+  warm_up_epoch: 10
+  start_lr: 1.0e-5
+  init_base_lr: 1.0e-4
+
+# 每個 key 都可以填 scalar 或 list；list 會做 Cartesian product 暴力搜尋。
+# 會生效：以下每個 key 都會被 build_trials() 展開並傳入訓練。
+search:
+  dropout: [0.1, 0.2]
+  weight_decay: [1.0e-4, 5.0e-4]
+  scheduler_type: ["None", "cos"]
+  regression_label_transform: ["none", "standardize"]
+  stage1_lr: [5.0e-5]
+  stage2_lr: [5.0e-5, 2.0e-5, 1.0e-5]
+  stage1_epochs: [20]
+  stage2_epochs: [120]
+  stage1_patience: [10]
+  stage2_patience: [10]
+  dist_bar:
+    - [10, 30]
+    - [10, 60]
+    - [20, 90]
+    - [20, 100]
+    - [30, 60]
+    - [40, 70]
+    - [40, 80]
+    - [50, 100]

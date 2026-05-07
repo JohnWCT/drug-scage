@@ -1,0 +1,40 @@
+# config/caco2_finetune_search_v2.yaml
+task: caco2
+dataroot: ./data/mpp/pkl
+splitroot: ./data/mpp/split
+split_type: random_scaffold
+result_dir: ./outputs/caco2_pipeline
+gpus: "0"
+
+fixed:
+  seed: 8
+  batch_size: 32
+  optim_type: adam
+  warm_up_epoch: 5
+  start_lr: 1.0e-5
+  init_base_lr: 1.0e-4
+  dropout: 0.1
+  weight_decay: 1.0e-4
+  scheduler_type: "None"
+  regression_label_transform: "none"
+  max_grad_norm: 1.0
+
+two_stage:
+  stage1_lr: 5.0e-5
+  stage1_epochs: 30         # 增加到 30，讓 head 充分收斂
+  stage1_patience: 15
+  stage2_epochs: 120
+  stage2_patience: 15       # 增加 stage2 耐心
+
+search:
+  stage2_lr: [5.0e-5, 2.0e-5]
+  encoder_lr_ratio: [0.01, 0.05, 0.1]     # 新增：encoder LR = stage2_lr * ratio
+  stage2_warmup_epochs: [0, 3, 5]          # 新增：stage2 warmup (前 N 個 epoch 從 start_lr 線性上升)
+  stage2_loss_weights:                      # 新增：控制 stage2 的輔助 loss 權重，避免太大破壞 representation
+    - {graph: 1.0, finger: 0.0, atom_fg: 0.0}
+    - {graph: 1.0, finger: 0.1, atom_fg: 0.1}
+  dist_bar:                                 # 基於前期試驗保留表現最好的四組 dist_bar
+    - [40, 80]
+    - [20, 90]
+    - [50, 100]
+    - [20, 100]

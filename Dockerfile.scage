@@ -1,0 +1,137 @@
+ARG BASE_IMAGE=nvcr.io/nvidia/pytorch:23.07-py3
+FROM ${BASE_IMAGE}
+
+ENV DEBIAN_FRONTEND=noninteractive \
+    PIP_NO_CACHE_DIR=1 \
+    PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    JUPYTER_PORT=8888
+
+WORKDIR /workspace
+
+# -----------------------------------------------------------------------------
+# System packages
+# -----------------------------------------------------------------------------
+RUN apt-get update && \
+    apt-get install -y --no-install-recommends \
+        build-essential \
+        pkg-config \
+        git \
+        curl \
+        ca-certificates \
+        vim \
+        libglib2.0-0 \
+        libgl1 \
+        libxrender1 \
+        libxext6 \
+        libsm6 \
+        libgomp1 && \
+    rm -rf /var/lib/apt/lists/*
+
+COPY requirements-scage.txt /tmp/requirements-scage.txt
+
+# -----------------------------------------------------------------------------
+# Packaging tools
+# -----------------------------------------------------------------------------
+RUN python -m pip install --upgrade pip setuptools wheel
+
+# -----------------------------------------------------------------------------
+# Replace the preinstalled NGC PyTorch snapshot with the stable SCAGE versions
+# -----------------------------------------------------------------------------
+RUN python -m pip uninstall -y \
+        torch torchvision torchaudio triton torchtext torchdata \
+    || true
+
+RUN python -m pip install --no-cache-dir \
+        torch==2.1.2 \
+        torchvision==0.16.2 \
+        torchaudio==2.1.2 \
+        --index-url https://download.pytorch.org/whl/cu121
+
+# -----------------------------------------------------------------------------
+# Install PyG extension wheels matching torch 2.1.2 + cu121
+# -----------------------------------------------------------------------------
+RUN python -m pip install --no-cache-dir \
+        pyg-lib==0.4.0+pt21cu121 \
+        torch-scatter==2.1.2+pt21cu121 \
+        torch-sparse==0.6.18+pt21cu121 \
+        torch-cluster==1.6.3+pt21cu121 \
+        torch-spline-conv==1.2.2+pt21cu121 \
+        -f https://data.pyg.org/whl/torch-2.1.2+cu121.html && \
+    python -m pip install --no-cache-dir torch-geometric==2.5.2
+
+# -----------------------------------------------------------------------------
+# Remaining Python requirements
+# -----------------------------------------------------------------------------
+RUN python -m pip install --no-cache-dir -r /tmp/requirements-scage.txt
+
+# -----------------------------------------------------------------------------
+# Force-fix protobuf compatibility and ensure RDKit is installed
+# -----------------------------------------------------------------------------
+RUN python -m pip install --no-cache-dir --force-reinstall protobuf==3.20.3 && \
+    python -m pip install --no-cache-dir rdkit==2023.9.4
+
+# -----------------------------------------------------------------------------
+# Compatibility fixes
+#   1. Pin setuptools < 82 so pkg_resources is still available at runtime
+#      (setuptools >= 82 removes it, which breaks several downstream packages)
+#   2. Upgrade lightning_utilities to suppress the pkg_resources deprecation
+#      UserWarning emitted by older versions (<= 0.11.2)
+# -----------------------------------------------------------------------------
+RUN python -m pip install --no-cache-dir --force-reinstall "setuptools<82" && \
+    python -m pip install --no-cache-dir --upgrade lightning_utilities
+
+# Optional kernel
+RUN python -m ipykernel install --user --name scage --display-name "Python (scage)"
+
+# -----------------------------------------------------------------------------
+# Jupyter config: disable token/password login
+# -----------------------------------------------------------------------------
+RUN mkdir -p /root/.jupyter && \
+    printf "%s\n" \
+      "c.NotebookApp.ip = '0.0.0.0'" \
+      "c.NotebookApp.port = 8888" \
+      "c.NotebookApp.open_browser = False" \
+      "c.NotebookApp.allow_root = True" \
+      "c.NotebookApp.notebook_dir = '/workspace'" \
+      "c.NotebookApp.token = ''" \
+      "c.NotebookApp.password = ''" \
+      > /root/.jupyter/jupyter_notebook_config.py && \
+    printf "%s\n" \
+      "c.ServerApp.ip = '0.0.0.0'" \
+      "c.ServerApp.port = 8888" \
+      "c.ServerApp.open_browser = False" \
+      "c.ServerApp.allow_root = True" \
+      "c.ServerApp.root_dir = '/workspace'" \
+      "c.ServerApp.token = ''" \
+      "c.ServerApp.password = ''" \
+      > /root/.jupyter/jupyter_server_config.py
+
+# -----------------------------------------------------------------------------
+# Sanity check
+# -----------------------------------------------------------------------------
+RUN python - <<'PY'
+import sys
+import torch
+import torch_geometric
+import rdkit
+import numpy
+import pandas
+import sklearn
+import google.protobuf
+
+print('Python:', sys.version)
+print('Torch:', torch.__version__)
+print('Torch CUDA:', torch.version.cuda)
+print('CUDA available at build:', torch.cuda.is_available())
+print('PyG:', torch_geometric.__version__)
+print('NumPy:', numpy.__version__)
+print('Pandas:', pandas.__version__)
+print('scikit-learn:', sklearn.__version__)
+print('protobuf:', google.protobuf.__version__)
+print('RDKit import: OK')
+PY
+
+EXPOSE 8888
+
+CMD ["jupyter", "lab", "--ip=0.0.0.0", "--port=8888", "--no-browser", "--allow-root", "--ServerApp.token=", "--ServerApp.password="]

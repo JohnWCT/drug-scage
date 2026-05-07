@@ -1,0 +1,34 @@
+task: caco2
+dataroot: ./data/mpp/pkl
+splitroot: ./data/mpp/split
+split_type: random_scaffold
+result_dir: ./outputs/caco2_pipeline_smoke
+gpus: "0"
+
+fixed:
+  seed: 8
+  batch_size: 32
+  optim_type: adam
+  warm_up_epoch: 10
+  start_lr: 1.0e-5
+  init_base_lr: 1.0e-4
+  # Smoke run 只保留 graph regression loss，方便確認 logPapp loss 方向。
+  loss_weights:
+    graph: 1.0
+    finger: 0.0
+    atom_fg: 0.0
+
+search:
+  dropout: [0.1]
+  weight_decay: [1.0e-4]
+  scheduler_type: ["None"]
+  # 參考 caco2_finetune_search_norm_compare.yaml：用 search list 控制標準化策略。
+  regression_label_transform: ["standardize"]
+  stage1_lr: [5.0e-5]
+  stage2_lr: [2.0e-5]
+  stage1_epochs: [3]
+  stage2_epochs: [5]
+  stage1_patience: [2]
+  stage2_patience: [3]
+  dist_bar:
+    - [30, 60]

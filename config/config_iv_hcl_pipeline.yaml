@@ -1,0 +1,32 @@
+task_name: iv_hcl
+target_col: CL
+input_csv: ./data/mpp/custom/IV_hCL.csv
+raw_dir: ./data/mpp/raw
+pkl_dir: ./data/mpp/pkl
+split_root: ./data/mpp
+result_dir: ./outputs/iv_hcl_pipeline
+
+split_type: random_scaffold
+seed: 8
+gpus: "0"
+num_cores: 16
+smiles_timeout_sec: 60
+dataloader_num_workers: 0
+pin_memory: false
+
+# Finetune 參數（與 config_finetune.yaml 風格一致）
+batch_size: 64
+epochs: 120
+patience: 25
+save_ckpt: 1
+dropout: 0.25
+ckpt: pretrain
+
+optim:
+  type: adam
+  init_lr: 1.0e-5
+  weight_decay: 1.0e-3
+
+lr_scheduler:
+  type: None
+  warm_up_epoch: 5

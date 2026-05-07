@@ -1,0 +1,49 @@
+# 3-step MPP finetune search config.
+# 建議在 docker scage container 的 /workspace 內執行：
+#   python 3_finetune_3step_mpp.py --search_config ./config/caco2_finetune_search_3step.yaml
+
+task: caco2
+dataroot: ./data/mpp/pkl
+splitroot: ./data/mpp/split
+split_type: random_scaffold
+result_dir: ./outputs/caco2_pipeline_3step
+gpus: "0"
+
+fixed:
+  seed: 8
+  batch_size: 32
+  optim_type: adam
+  warm_up_epoch: 10
+  start_lr: 1.0e-5
+  init_base_lr: 1.0e-4
+
+search:
+  dropout: [0.1, 0.2]
+  weight_decay: [1.0e-4, 5.0e-4]
+  scheduler_type: ["None", "cos"]
+  regression_label_transform: ["none", "standardize"]
+
+  # Stage 1: freeze encoder，只訓練 head_Graph，loss 只開 graph。
+  stage1_lr: [5.0e-5]
+  stage1_epochs: [20]
+  stage1_patience: [10]
+
+  # Stage 2: 載入 Stage 1 best，freeze encoder，訓練 graph/finger/atom_fg 三個 head。
+  stage2_lr: [5.0e-5, 2.0e-5]
+  stage2_epochs: [30]
+  stage2_patience: [10]
+
+  # Stage 3: 載入 Stage 2 best，解凍全模型 finetune。
+  stage3_lr: [2.0e-5, 1.0e-5]
+  stage3_epochs: [120]
+  stage3_patience: [10]
+
+  dist_bar:
+    - [10, 30]
+    - [10, 60]
+    - [20, 90]
+    - [20, 100]
+    - [30, 60]
+    - [40, 70]
+    - [40, 80]
+    - [50, 100]
