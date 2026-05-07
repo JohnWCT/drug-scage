@@ -166,3 +166,21 @@ outputs/
 data/
 weights/
 finetune_result/
+
+# Model / checkpoint binaries
+*.pth
+*.pt
+*.ckpt
+*.onnx
+*.bin
+*.safetensors
+
+# Serialized datasets / arrays
+*.pkl
+*.pickle
+*.joblib
+*.npz
+*.npy
+
+# Cursor local settings
+.cursor/
