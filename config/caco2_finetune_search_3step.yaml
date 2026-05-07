@@ -37,7 +37,7 @@ fixed:
 search:
   dropout: [0.1, 0.2]
   weight_decay: [1.0e-4, 5.0e-4]
-  scheduler_type: ["None", "cos"]
+  scheduler_type: ["cos"]
   regression_label_transform: ["none", "standardize"]
 
   # Stage 1: freeze encoder，只訓練 head_Graph，loss 只開 graph。
@@ -51,9 +51,10 @@ search:
   stage2_patience: [10]
 
   # Stage 3: 載入 Stage 2 best，解凍全模型 finetune。
-  stage3_lr: [2.0e-5, 1.0e-5]
+  stage3_lr: [1.0e-5]
   stage3_epochs: [120]
-  stage3_patience: [10]
+  stage3_patience: [15]
+  stage3_warmup_epochs: [15]
 
   dist_bar:
     - [10, 30]
