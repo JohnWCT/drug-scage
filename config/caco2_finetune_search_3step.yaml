@@ -18,21 +18,19 @@ fixed:
   warm_up_epoch: 10
   start_lr: 1.0e-5
   init_base_lr: 1.0e-4
+  loss_weights: null
   encoder_lr_ratio: 0.05
   max_grad_norm: 1.0
   eval_before_train: true
+  mt_loss_eps: 1.0e-8
+  mt_loss_tau: 2.0
+  mt_ratio_clip: 5.0
   stage1_loss_weights:
     graph: 1.0
     finger: 0.0
     atom_fg: 0.0
-  stage2_loss_weights:
-    graph: 1.0
-    finger: 0.05
-    atom_fg: 0.05
-  stage3_loss_weights:
-    graph: 1.0
-    finger: 0.0
-    atom_fg: 0.0
+  stage2_loss_weights: null
+  stage3_loss_weights: null
 
 search:
   dropout: [0.1, 0.2]
@@ -51,10 +49,10 @@ search:
   stage2_patience: [10]
 
   # Stage 3: 載入 Stage 2 best，解凍全模型 finetune。
-  stage3_lr: [1.0e-5]
+  stage3_lr: [2.0e-5]
   stage3_epochs: [120]
-  stage3_patience: [15]
-  stage3_warmup_epochs: [15]
+  stage3_patience: [20]
+  stage3_warmup_epochs: [10]
 
   dist_bar:
     - [10, 30]

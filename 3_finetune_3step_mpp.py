@@ -187,8 +187,57 @@ class CustomTrainer(upstream.Trainer):
     def __init__(self, config, file_path):
         super().__init__(config, file_path)
         self.regression_target_transform = self._build_regression_target_transform()
+        self.last_mt_weights = None
 
-    def calc_mt_loss(self, loss_list):
+    def calc_dynamic_mt_loss(self, loss_list, update_state=True):
+        loss_list = torch.stack(loss_list)
+        eps = float(self.config.get("mt_loss_eps", 1e-8))
+        tau = float(self.config.get("mt_loss_tau", 2.0))
+        ratio_clip = float(self.config.get("mt_ratio_clip", 5.0))
+        step = int(self.cur_loss_step.item())
+
+        if step == 0 and not update_state:
+            return loss_list.mean()
+
+        if step == 0:
+            denom = loss_list.detach().clamp_min(eps)
+            if update_state:
+                self.loss_init[:, 0] = loss_list.detach()
+                self.loss_last2[:, 0] = loss_list.detach()
+                self.cur_loss_step += 1
+            self.last_mt_weights = torch.ones_like(loss_list).detach() / loss_list.numel()
+            return (loss_list / denom).mean()
+
+        if step == 1:
+            denom = self.loss_init[:, :1].mean(dim=-1).clamp_min(eps)
+            if update_state:
+                self.loss_last[:, 0] = loss_list.detach()
+                self.loss_init[:, 1] = loss_list.detach()
+                self.cur_loss_step += 1
+            self.last_mt_weights = torch.ones_like(loss_list).detach() / loss_list.numel()
+            return (loss_list / denom).mean()
+
+        init_cols = min(step, self.batch_considered)
+        last_cols = min(max(step - 1, 1), self.batch_considered // 10)
+        cur_loss_init = self.loss_init[:, :init_cols].mean(dim=-1).clamp_min(eps)
+        cur_loss_last = self.loss_last[:, :last_cols].mean(dim=-1).clamp_min(eps)
+        cur_loss_last2 = self.loss_last2[:, :last_cols].mean(dim=-1).clamp_min(eps)
+        ratio = (cur_loss_last / cur_loss_last2).clamp(min=1.0 / ratio_clip, max=ratio_clip)
+        weights = F.softmax(ratio / tau, dim=-1).detach()
+        self.last_mt_weights = weights.detach()
+        total_loss = (loss_list / cur_loss_init * weights).sum()
+
+        if update_state:
+            cur_init_idx = step % self.batch_considered
+            self.loss_init[:, cur_init_idx] = loss_list.detach()
+            cur_last_idx = (step - 1) % (self.batch_considered // 10)
+            prev_last_idx = (cur_last_idx - 1) % (self.batch_considered // 10)
+            self.loss_last2[:, cur_last_idx] = self.loss_last[:, prev_last_idx]
+            self.loss_last[:, cur_last_idx] = loss_list.detach()
+            self.cur_loss_step += 1
+        return total_loss
+
+    def calc_mt_loss(self, loss_list, update_state=True):
         loss_weights = self.config.get("loss_weights")
         if loss_weights:
             loss_list = torch.stack(loss_list)
@@ -205,7 +254,7 @@ class CustomTrainer(upstream.Trainer):
             if active <= 0:
                 raise ValueError("At least one loss weight must be > 0.")
             return torch.sum(loss_list * weights) / active
-        return super().calc_mt_loss(loss_list)
+        return self.calc_dynamic_mt_loss(loss_list, update_state=update_state)
 
     def _build_regression_target_transform(self):
         transform_type = self.config.get("regression_label_transform", "none")
@@ -329,7 +378,7 @@ class CustomTrainer(upstream.Trainer):
             return torch.optim.SGD(param_groups, lr=lr, weight_decay=weight_decay, momentum=momentum)
         raise ValueError("not supported optimizer!")
 
-    def _step(self, model, batch: Dict[str, Tensor]):
+    def _step(self, model, batch: Dict[str, Tensor], update_mt_state=True):
         dataset_form: str = get_dataset_form()
         pred_dict: Dict = model(batch)
         pred = pred_dict["graph_feature"]
@@ -375,7 +424,10 @@ class CustomTrainer(upstream.Trainer):
             label = self._transform_regression_label(batch["label"].float())
             loss_graph = self.criterion(pred.view(label.shape), label)
 
-        total_loss = self.calc_mt_loss([loss_graph, loss_finger, loss_atom_fg])
+        total_loss = self.calc_mt_loss(
+            [loss_graph, loss_finger, loss_atom_fg],
+            update_state=update_mt_state,
+        )
         loss_parts = {
             "graph_loss": float(loss_graph.detach().item()),
             "finger_loss": float(loss_finger.detach().item()),
@@ -412,7 +464,7 @@ class CustomTrainer(upstream.Trainer):
                      if value is not None and not isinstance(value, list)}
             batch["edge_weight"] = None
 
-            loss, pred, loss_parts = self._step(self.net, batch)
+            loss, pred, loss_parts = self._step(self.net, batch, update_mt_state=True)
             train_loss += loss.item()
             for key in loss_parts_sum:
                 loss_parts_sum[key] += loss_parts[key]
@@ -457,7 +509,7 @@ class CustomTrainer(upstream.Trainer):
                      if value is not None and not isinstance(value, list)}
             batch["edge_weight"] = None
             with torch.no_grad():
-                loss, pred, loss_parts = self._step(self.net, batch)
+                loss, pred, loss_parts = self._step(self.net, batch, update_mt_state=False)
             valid_loss += loss.item()
             for key in loss_parts_sum:
                 loss_parts_sum[key] += loss_parts[key]
@@ -830,6 +882,9 @@ def build_config(base_args, trial, trainable_scope, checkpoint):
     config["encoder_lr_ratio"] = trial.get("encoder_lr_ratio", 1.0)
     config["max_grad_norm"] = trial.get("max_grad_norm", 0.0)
     config["eval_before_train"] = trial.get("eval_before_train", True)
+    config["mt_loss_eps"] = trial.get("mt_loss_eps", 1e-8)
+    config["mt_loss_tau"] = trial.get("mt_loss_tau", 2.0)
+    config["mt_ratio_clip"] = trial.get("mt_ratio_clip", 5.0)
     config["pretrain_model_path"] = "None"
     config = get_downstream_task_names(config)
     set_seed(config["seed"])
@@ -916,20 +971,17 @@ def build_trials(cfg, default_dist_bar):
         "encoder_lr_ratio": fixed.get("encoder_lr_ratio", 0.05),
         "max_grad_norm": fixed.get("max_grad_norm", 1.0),
         "eval_before_train": fixed.get("eval_before_train", True),
+        "mt_loss_eps": fixed.get("mt_loss_eps", 1e-8),
+        "mt_loss_tau": fixed.get("mt_loss_tau", 2.0),
+        "mt_ratio_clip": fixed.get("mt_ratio_clip", 5.0),
         "stage2_warmup_epochs": three_stage.get("stage2_warmup_epochs", fixed.get("warm_up_epoch", 5)),
         "stage3_warmup_epochs": three_stage.get("stage3_warmup_epochs", fixed.get("warm_up_epoch", 5)),
         "stage1_loss_weights": fixed.get(
             "stage1_loss_weights",
             {"graph": 1.0, "finger": 0.0, "atom_fg": 0.0},
         ),
-        "stage2_loss_weights": fixed.get(
-            "stage2_loss_weights",
-            {"graph": 1.0, "finger": 0.05, "atom_fg": 0.05},
-        ),
-        "stage3_loss_weights": fixed.get(
-            "stage3_loss_weights",
-            {"graph": 1.0, "finger": 0.0, "atom_fg": 0.0},
-        ),
+        "stage2_loss_weights": fixed.get("stage2_loss_weights", None),
+        "stage3_loss_weights": fixed.get("stage3_loss_weights", fixed.get("loss_weights")),
         "dist_bar": fixed.get("dist_bar", default_dist_bar),
     }
     grids = {key: as_list(search.get(key), base[key]) for key in base if key != "dist_bar"}
@@ -1048,6 +1100,9 @@ def main():
                 "encoder_lr_ratio": trial_cfg.get("encoder_lr_ratio", 0.05),
                 "max_grad_norm": trial_cfg.get("max_grad_norm", 1.0),
                 "eval_before_train": trial_cfg.get("eval_before_train", True),
+                "mt_loss_eps": trial_cfg.get("mt_loss_eps", 1e-8),
+                "mt_loss_tau": trial_cfg.get("mt_loss_tau", 2.0),
+                "mt_ratio_clip": trial_cfg.get("mt_ratio_clip", 5.0),
                 "regression_label_transform": trial_cfg.get("regression_label_transform", "none"),
                 "dist_bar": trial_cfg["dist_bar"],
             }
@@ -1080,6 +1135,9 @@ def main():
                 "encoder_lr_ratio": trial_cfg.get("encoder_lr_ratio", 0.05),
                 "max_grad_norm": trial_cfg.get("max_grad_norm", 1.0),
                 "eval_before_train": trial_cfg.get("eval_before_train", True),
+                "mt_loss_eps": trial_cfg.get("mt_loss_eps", 1e-8),
+                "mt_loss_tau": trial_cfg.get("mt_loss_tau", 2.0),
+                "mt_ratio_clip": trial_cfg.get("mt_ratio_clip", 5.0),
                 "regression_label_transform": trial_cfg.get("regression_label_transform", "none"),
                 "dist_bar": trial_cfg["dist_bar"],
             }
@@ -1122,6 +1180,9 @@ def main():
                 "encoder_lr_ratio": trial_cfg.get("encoder_lr_ratio", 0.05),
                 "max_grad_norm": trial_cfg.get("max_grad_norm", 1.0),
                 "eval_before_train": trial_cfg.get("eval_before_train", True),
+                "mt_loss_eps": trial_cfg.get("mt_loss_eps", 1e-8),
+                "mt_loss_tau": trial_cfg.get("mt_loss_tau", 2.0),
+                "mt_ratio_clip": trial_cfg.get("mt_ratio_clip", 5.0),
                 "regression_label_transform": trial_cfg.get("regression_label_transform", "none"),
                 "dist_bar": trial_cfg["dist_bar"],
             }
@@ -1165,6 +1226,9 @@ def main():
                 "encoder_lr_ratio": trial_cfg.get("encoder_lr_ratio", 0.05),
                 "max_grad_norm": trial_cfg.get("max_grad_norm", 1.0),
                 "eval_before_train": trial_cfg.get("eval_before_train", True),
+                "mt_loss_eps": trial_cfg.get("mt_loss_eps", 1e-8),
+                "mt_loss_tau": trial_cfg.get("mt_loss_tau", 2.0),
+                "mt_ratio_clip": trial_cfg.get("mt_ratio_clip", 5.0),
                 "regression_label_transform": trial_cfg.get("regression_label_transform", "none"),
                 "dist_bar": trial_cfg["dist_bar"],
             }
