@@ -27,6 +27,12 @@ htmlcov/
 
 ### Project outputs (large folders)
 data/
+!data/
+data/*
+!data/mpp/
+data/mpp/*
+!data/mpp/custom/
+!data/mpp/custom/**
 weights/
 outputs/
 result/
