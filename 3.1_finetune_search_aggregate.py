@@ -130,6 +130,11 @@ def ranking_scalar(candidate: Dict[str, Any]) -> Optional[float]:
     return primary_valid_score_for_ranking(candidate.get("stage1_valid"))
 
 
+def ranking_task_type(candidate: Dict[str, Any]) -> Optional[str]:
+    metric = candidate.get("valid") or candidate.get("stage1_valid") or {}
+    return metric.get("task_type")
+
+
 def build_one_candidate(
     payload: Dict[str, Any],
     trial_root: Path,
@@ -250,18 +255,23 @@ def _to_jsonable(obj: Any) -> Any:
 
 
 def mark_best_among_scanned(candidates: List[Dict[str, Any]]) -> None:
-    scored: List[Tuple[float, int]] = []
+    scored: List[Tuple[float, int, Optional[str]]] = []
     for i, c in enumerate(candidates):
         r = ranking_scalar(c)
         if r is not None:
-            scored.append((r, i))
+            scored.append((r, i, ranking_task_type(c)))
     if not scored:
         for c in candidates:
             c["is_best"] = False
             c["is_best_among_scanned"] = False
         return
-    # Higher score wins; tie-break by lower trial idx (deterministic).
-    scored.sort(key=lambda x: (-x[0], candidates[x[1]]["idx"]))
+    # Regression uses RMSE, so lower wins; classification uses ROC-AUC, so higher wins.
+    scored.sort(
+        key=lambda x: (
+            x[0] if x[2] == "regression" else -x[0],
+            candidates[x[1]]["idx"],
+        )
+    )
     best_i = scored[0][1]
     for j, c in enumerate(candidates):
         c["is_best"] = False

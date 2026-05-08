@@ -188,6 +188,7 @@ class CustomTrainer(upstream.Trainer):
         super().__init__(config, file_path)
         self.regression_target_transform = self._build_regression_target_transform()
         self.last_mt_weights = None
+        self.best_metadata = {}
 
     def calc_dynamic_mt_loss(self, loss_list, update_state=True):
         loss_list = torch.stack(loss_list)
@@ -253,6 +254,7 @@ class CustomTrainer(upstream.Trainer):
             active = torch.sum(weights)
             if active <= 0:
                 raise ValueError("At least one loss weight must be > 0.")
+            self.last_mt_weights = (weights / active).detach()
             return torch.sum(loss_list * weights) / active
         return self.calc_dynamic_mt_loss(loss_list, update_state=update_state)
 
@@ -304,10 +306,82 @@ class CustomTrainer(upstream.Trainer):
         return pred * std + mean
 
     def _checkpoint_payload(self):
-        payload = {"model": self.net.state_dict()}
+        payload = {
+            "model": self.net.state_dict(),
+            "metadata": getattr(self, "best_metadata", {}),
+        }
         if self.config["task"] == "regression":
             payload["target_transform"] = self.regression_target_transform
         return payload
+
+    @staticmethod
+    def _metric_float(metric_dict: Dict, key: str):
+        value = metric_dict.get(key)
+        return float(value) if value is not None else float(np.nan)
+
+    def _current_dist_bar(self):
+        if GlobalVar.dist_bar is None:
+            return None
+        return list(np.asarray(GlobalVar.dist_bar).tolist())
+
+    def _mt_weights_dict(self):
+        if self.last_mt_weights is None:
+            return None
+        weights = self.last_mt_weights.detach().cpu()
+        return {
+            "graph": float(weights[0]),
+            "finger": float(weights[1]),
+            "atom_fg": float(weights[2]),
+        }
+
+    def _update_best_metadata(
+        self,
+        epoch,
+        valid_select_metric,
+        train_metrics,
+        valid_metrics,
+        test_metrics,
+    ):
+        if self.config["task"] == "classification":
+            self.best_metadata = {
+                "selection_metric": "valid_auc",
+                "best_epoch": int(epoch),
+                "best_valid_metric": float(valid_select_metric),
+                "best_valid_auc": self._metric_float(valid_metrics, "auc"),
+                "best_test_auc": self._metric_float(test_metrics, "auc"),
+                "stage_name": self.config.get("stage_name"),
+                "trial_serial": self.config.get("trial_serial"),
+                "dist_bar": self._current_dist_bar(),
+                "loss_weights": self.config.get("loss_weights"),
+                "mt_loss_tau": self.config.get("mt_loss_tau"),
+                "mt_ratio_clip": self.config.get("mt_ratio_clip"),
+                "encoder_lr_ratio": self.config.get("encoder_lr_ratio"),
+                "max_grad_norm": self.config.get("max_grad_norm"),
+            }
+            return
+
+        self.best_metadata = {
+            "selection_metric": "valid_rmse",
+            "best_epoch": int(epoch),
+            "best_valid_metric": float(valid_select_metric),
+            "best_train_rmse": self._metric_float(train_metrics, "rmse"),
+            "best_train_mae": self._metric_float(train_metrics, "mae"),
+            "best_train_r2": self._metric_float(train_metrics, "r2"),
+            "best_valid_rmse": self._metric_float(valid_metrics, "rmse"),
+            "best_valid_mae": self._metric_float(valid_metrics, "mae"),
+            "best_valid_r2": self._metric_float(valid_metrics, "r2"),
+            "best_test_rmse": self._metric_float(test_metrics, "rmse"),
+            "best_test_mae": self._metric_float(test_metrics, "mae"),
+            "best_test_r2": self._metric_float(test_metrics, "r2"),
+            "stage_name": self.config.get("stage_name"),
+            "trial_serial": self.config.get("trial_serial"),
+            "dist_bar": self._current_dist_bar(),
+            "loss_weights": self.config.get("loss_weights"),
+            "mt_loss_tau": self.config.get("mt_loss_tau"),
+            "mt_ratio_clip": self.config.get("mt_ratio_clip"),
+            "encoder_lr_ratio": self.config.get("encoder_lr_ratio"),
+            "max_grad_norm": self.config.get("max_grad_norm"),
+        }
 
     @staticmethod
     def _is_trainable_head(name: str) -> bool:
@@ -428,10 +502,14 @@ class CustomTrainer(upstream.Trainer):
             [loss_graph, loss_finger, loss_atom_fg],
             update_state=update_mt_state,
         )
+        raw_total_loss = loss_graph + loss_finger + loss_atom_fg
+        raw_mean_loss = raw_total_loss / 3.0
         loss_parts = {
             "graph_loss": float(loss_graph.detach().item()),
             "finger_loss": float(loss_finger.detach().item()),
             "atom_fg_loss": float(loss_atom_fg.detach().item()),
+            "raw_total_loss": float(raw_total_loss.detach().item()),
+            "raw_mean_loss": float(raw_mean_loss.detach().item()),
         }
         return total_loss, pred, loss_parts
 
@@ -439,8 +517,7 @@ class CustomTrainer(upstream.Trainer):
         if self.config["task"] == "regression":
             y_pred = self._inverse_regression_pred(y_pred)
             mae, rmse, r2 = compute_reg_metric_with_r2(y_true, y_pred)
-            primary = mae if self.config["task_name"] in ["qm7", "qm8", "qm9"] else rmse
-            return primary, {"mae": mae, "rmse": rmse, "r2": r2}
+            return rmse, {"mae": mae, "rmse": rmse, "r2": r2}
         roc_auc = compute_cls_metric_tensor(y_true, y_pred)
         return roc_auc, {"auc": roc_auc}
 
@@ -448,7 +525,7 @@ class CustomTrainer(upstream.Trainer):
         self.net.train()
         num_data = 0
         train_loss = 0
-        loss_parts_sum = {"graph_loss": 0.0, "finger_loss": 0.0, "atom_fg_loss": 0.0}
+        loss_parts_sum = {key: 0.0 for key in self._loss_part_keys()}
         y_pred: Tensor = Tensor().to("cuda")
         y_true: Tensor = Tensor().to("cuda")
         progress = tqdm(
@@ -496,7 +573,7 @@ class CustomTrainer(upstream.Trainer):
         y_true = Tensor().to("cuda")
         valid_loss = 0
         num_data = 0
-        loss_parts_sum = {"graph_loss": 0.0, "finger_loss": 0.0, "atom_fg_loss": 0.0}
+        loss_parts_sum = {key: 0.0 for key in self._loss_part_keys()}
         progress = tqdm(
             valid_loader,
             desc=self._progress_label(split_name),
@@ -544,14 +621,23 @@ class CustomTrainer(upstream.Trainer):
 
         self.start_epoch = 1
         self.optim_steps = 0
-        self.best_metric = -np.inf
+        self.best_metric = self._initial_best_metric()
         self.writer = upstream.create_fresh_writer(self.config)
 
     def _is_better(self, metric, best_metric):
-        return metric > best_metric
+        if metric is None:
+            return False
+        if self.config["task"] == "classification":
+            return metric > best_metric
+        return metric < best_metric
+
+    def _initial_best_metric(self):
+        if self.config["task"] == "classification":
+            return -np.inf
+        return np.inf
 
     def _metric_label(self):
-        return "AUC" if self.config["task"] == "classification" else "R2"
+        return "AUC" if self.config["task"] == "classification" else "RMSE"
 
     def _stage_title(self):
         stage_name = self.config.get("stage_name") or self.config.get("run_tag") or "train"
@@ -577,13 +663,22 @@ class CustomTrainer(upstream.Trainer):
         }
         return postfix
 
+    def _loss_part_keys(self):
+        return [
+            "graph_loss",
+            "finger_loss",
+            "atom_fg_loss",
+            "raw_total_loss",
+            "raw_mean_loss",
+        ]
+
     def _epoch_metric_value(self, metric_dict: Dict):
         if self.config["task"] == "classification":
             return metric_dict.get("auc")
-        return metric_dict.get("r2")
+        return metric_dict.get("rmse")
 
     def _epoch_metric_key(self):
-        return "auc" if self.config["task"] == "classification" else "r2"
+        return "auc" if self.config["task"] == "classification" else "rmse"
 
     def _epoch_postfix(self, train_loss, valid_loss, test_loss, train_metrics, valid_metrics, test_metrics):
         metric_key = self._epoch_metric_key()
@@ -611,10 +706,11 @@ class CustomTrainer(upstream.Trainer):
         train_loss_list, valid_loss_list, test_loss_list = [], [], []
         train_metric_list, val_metric_list, test_metric_list = [], [], []
         train_r2_list, val_r2_list, test_r2_list = [], [], []
+        loss_part_keys = self._loss_part_keys()
         loss_part_history = {
-            "train": {"graph_loss": [], "finger_loss": [], "atom_fg_loss": []},
-            "valid": {"graph_loss": [], "finger_loss": [], "atom_fg_loss": []},
-            "test": {"graph_loss": [], "finger_loss": [], "atom_fg_loss": []},
+            "train": {key: [] for key in loss_part_keys},
+            "valid": {key: [] for key in loss_part_keys},
+            "test": {key: [] for key in loss_part_keys},
         }
         best_epoch = None
         best_model_path = os.path.join(self.writer.log_dir, "model.pth")
@@ -647,7 +743,8 @@ class CustomTrainer(upstream.Trainer):
                 f"valid_loss:{valid_loss0} test_loss:{test_loss0}\n"
                 f"valid_metric:{valid_metric0} test_metric:{test_metric0}\n"
                 f"valid_metrics:{valid_metrics0} test_metrics:{test_metrics0}\n"
-                f"valid_loss_parts:{valid_parts0} test_loss_parts:{test_parts0}",
+                f"valid_loss_parts:{valid_parts0} test_loss_parts:{test_parts0}\n"
+                f"mt_weights:{self._mt_weights_dict()}",
             )
         for i in epoch_progress:
             if self.config["lr_scheduler"]["type"] in ["cos", "square", "linear"]:
@@ -657,7 +754,6 @@ class CustomTrainer(upstream.Trainer):
             valid_loss, valid_metric, valid_parts, valid_metrics = self._valid_step(self.val_loader, "valid")
             test_loss, test_metric, test_parts, test_metrics = self._valid_step(self.test_loader, "test")
             valid_select_metric = self._epoch_metric_value(valid_metrics)
-            test_select_metric = self._epoch_metric_value(test_metrics)
 
             epoch_list.append(i)
             train_loss_list.append(train_loss)
@@ -678,10 +774,30 @@ class CustomTrainer(upstream.Trainer):
             if self._is_better(valid_select_metric, self.best_metric):
                 self.best_metric = valid_select_metric
                 best_epoch = i
+                self._update_best_metadata(
+                    i,
+                    valid_select_metric,
+                    train_metrics,
+                    valid_metrics,
+                    test_metrics,
+                )
                 self._save_best_model()
-                write_record(self.txtfile, f"best_model_updated epoch:{best_epoch} path:{best_model_path}")
+                write_record(
+                    self.txtfile,
+                    f"best_model_updated epoch:{best_epoch} "
+                    f"selection_metric:{self.best_metadata.get('selection_metric')} "
+                    f"valid_{self._epoch_metric_key()}:{valid_select_metric} "
+                    f"path:{best_model_path}",
+                )
 
-            if stopper.step(valid_loss, self.net, test_score=test_loss):
+            if self.config["task"] == "classification":
+                early_stop_score = -valid_metrics["auc"]
+                early_stop_test_score = -test_metrics["auc"]
+            else:
+                early_stop_score = valid_metrics["rmse"]
+                early_stop_test_score = test_metrics["rmse"]
+
+            if stopper.step(early_stop_score, self.net, test_score=early_stop_test_score):
                 stopper.report_final_results(i_epoch=i)
                 break
 
@@ -693,7 +809,8 @@ class CustomTrainer(upstream.Trainer):
                 f"train_loss:{train_loss} valid_loss:{valid_loss} test_loss:{test_loss}\n"
                 f"train_metric:{train_metric} valid_metric:{valid_metric} test_metric:{test_metric}\n"
                 f"train_metrics:{train_metrics} valid_metrics:{valid_metrics} test_metrics:{test_metrics}\n"
-                f"train_loss_parts:{train_parts} valid_loss_parts:{valid_parts} test_loss_parts:{test_parts}",
+                f"train_loss_parts:{train_parts} valid_loss_parts:{valid_parts} test_loss_parts:{test_parts}\n"
+                f"mt_weights:{self._mt_weights_dict()}",
             )
             epoch_progress.set_postfix(
                 self._epoch_postfix(
@@ -705,7 +822,7 @@ class CustomTrainer(upstream.Trainer):
             if self.config["task"] == "classification":
                 best_idx = int(np.argmax(val_metric_list))
             else:
-                best_idx = int(np.argmax(val_r2_list))
+                best_idx = int(np.argmin(val_metric_list))
             best_epoch = epoch_list[best_idx]
         self._save_learning_curve(
             epoch_list, train_loss_list, valid_loss_list, test_loss_list,
@@ -716,12 +833,15 @@ class CustomTrainer(upstream.Trainer):
         write_record(self.txtfile, f"best_epoch:{best_epoch}\tbest_model_path:{best_model_path}")
         metric_key = self._epoch_metric_key()
         best_idx = epoch_list.index(best_epoch)
+        train_best_metric = train_metric_list[best_idx]
+        valid_best_metric = val_metric_list[best_idx]
+        test_best_metric = test_metric_list[best_idx]
         tqdm.write(
             f"[Trial {trial_serial}] {stage_title} completed | "
             f"best_epoch={best_epoch} | "
-            f"train_{metric_key}={self._epoch_metric_value({'auc': train_metric_list[best_idx], 'r2': train_r2_list[best_idx] if train_r2_list else None}):.6f} | "
-            f"valid_{metric_key}={self._epoch_metric_value({'auc': val_metric_list[best_idx], 'r2': val_r2_list[best_idx] if val_r2_list else None}):.6f} | "
-            f"test_{metric_key}={self._epoch_metric_value({'auc': test_metric_list[best_idx], 'r2': test_r2_list[best_idx] if test_r2_list else None}):.6f} | "
+            f"train_{metric_key}={train_best_metric:.6f} | "
+            f"valid_{metric_key}={valid_best_metric:.6f} | "
+            f"test_{metric_key}={test_best_metric:.6f} | "
             f"model={best_model_path}"
         )
         if os.path.exists(stopper_tmp_path):
@@ -1019,15 +1139,19 @@ def eval_settings(args, trial):
 
 
 def metric_is_better(task_type, new_metric, best_metric):
+    if new_metric is None:
+        return False
     if best_metric is None:
         return True
+    if task_type == "regression":
+        return new_metric < best_metric
     return new_metric > best_metric
 
 
 def predict_primary_metric_name(metric):
     if metric["task_type"] == "classification":
         return "roc_auc" if "roc_auc" in metric else "auc"
-    return "r2"
+    return "rmse"
 
 
 def main():

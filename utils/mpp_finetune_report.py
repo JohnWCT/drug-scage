@@ -6,6 +6,47 @@ import json
 from typing import Any, Dict, List, Optional
 
 
+def _load_checkpoint_metadata(model_path: Optional[str]) -> Dict[str, Any]:
+    if not model_path:
+        return {}
+    try:
+        import torch
+
+        ckpt = torch.load(model_path, map_location="cpu")
+    except Exception:
+        return {}
+    if not isinstance(ckpt, dict):
+        return {}
+    metadata = ckpt.get("metadata") or {}
+    return metadata if isinstance(metadata, dict) else {}
+
+
+def _metadata_metric_columns(metadata: Dict[str, Any]) -> Dict[str, Any]:
+    if not metadata:
+        return {}
+
+    row = {
+        "selection_metric": metadata.get("selection_metric"),
+        "best_epoch": metadata.get("best_epoch"),
+        "best_valid_metric": metadata.get("best_valid_metric"),
+    }
+    if metadata.get("selection_metric") == "valid_auc":
+        row.update({
+            "valid_roc_auc": metadata.get("best_valid_auc"),
+            "test_roc_auc": metadata.get("best_test_auc"),
+        })
+    else:
+        row.update({
+            "valid_mae": metadata.get("best_valid_mae"),
+            "valid_rmse": metadata.get("best_valid_rmse"),
+            "valid_r2": metadata.get("best_valid_r2"),
+            "test_mae": metadata.get("best_test_mae"),
+            "test_rmse": metadata.get("best_test_rmse"),
+            "test_r2": metadata.get("best_test_r2"),
+        })
+    return row
+
+
 def flatten_metric(prefix: str, metric: Optional[Dict[str, Any]]) -> Dict[str, Any]:
     row: Dict[str, Any] = {}
     if not metric:
@@ -95,6 +136,7 @@ def build_stage_score_rows(candidate: Dict[str, Any]) -> List[Dict[str, Any]]:
     params = candidate["params"]
     base = {
         "idx": candidate["idx"],
+        "trial_serial": params.get("trial_serial", candidate.get("idx")),
         "single_stage": params.get("single_stage", False),
         "completion": candidate.get("completion"),
         "seed": params.get("seed"),
@@ -134,17 +176,19 @@ def build_stage_score_rows(candidate: Dict[str, Any]) -> List[Dict[str, Any]]:
         })
         row.update(_metric_split_columns("valid", valid_metric))
         row.update(_metric_split_columns("test", test_metric))
+        metadata = _load_checkpoint_metadata(model_path)
+        row.update(_metadata_metric_columns(metadata))
         rows.append(row)
     return rows
 
 
 def primary_valid_score_for_ranking(valid_metric: Optional[Dict[str, Any]]) -> Optional[float]:
-    """Match 3_finetune_2step_mpp: classification -> roc_auc, regression -> r2."""
+    """Primary ranking metric: classification -> roc_auc, regression -> rmse."""
     if not valid_metric or valid_metric.get("task_type") == "unknown":
         return None
     tt = valid_metric.get("task_type")
     if tt == "classification":
         return valid_metric.get("roc_auc")
     if tt == "regression":
-        return valid_metric.get("r2")
+        return valid_metric.get("rmse")
     return None

@@ -393,6 +393,12 @@ def restore_global_dist_bar_from_ckpt(ckpt_path: str):
         elif hasattr(dist_bar, 'tolist'):
             dist_bar = dist_bar.tolist()
         GlobalVar.dist_bar = list(dist_bar)
+        return
+
+    metadata = ckpt.get('metadata', {}) if isinstance(ckpt, dict) else {}
+    dist_bar = metadata.get('dist_bar') if isinstance(metadata, dict) else None
+    if dist_bar is not None:
+        GlobalVar.dist_bar = list(dist_bar)
 
 
 def load_precomputed_subset(
