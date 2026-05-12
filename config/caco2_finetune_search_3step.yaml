@@ -1,6 +1,6 @@
 # Caco2 / logPapp 3-step finetune config
-# Focus: dist_bar search only, using 10-step boundaries.
-# Keep known good dist_bar anchors: [20, 90], [20, 100], [50, 100].
+# Focus: dist_bar + transform + graph-prior search.
+# Keep known good dist_bar anchors and test winsorized labels.
 # Run:
 # python 3_finetune_3step_mpp.py --search_config ./config/caco2_finetune_search_3step_distbar_90_100_with_anchors.yaml
 
@@ -9,7 +9,7 @@ task: caco2
 dataroot: ./data/mpp/pkl
 splitroot: ./data/mpp/split
 split_type: random_scaffold
-result_dir: ./outputs/caco2_pipeline_3step_distbar_90_100_with_anchors
+result_dir: ./outputs/caco2_pipeline_3step_winsorized_graph_prior
 gpus: "0"
 
 fixed:
@@ -20,6 +20,8 @@ fixed:
   weight_decay: 1.0e-4
   scheduler_type: cos
   regression_label_transform: none
+  winsorize_quantile_low: 0.01
+  winsorize_quantile_high: 0.99
 
   optim_type: adam
   warm_up_epoch: 10
@@ -40,6 +42,13 @@ fixed:
   mt_loss_eps: 1.0e-8
   mt_loss_tau: 5.0
   mt_ratio_clip: 2.0
+  mt_loss_prior: null
+
+  # Optional label-bin weighted regression loss (off by default).
+  graph_label_reweight: false
+  graph_label_bins: [-8.0, -7.0, -6.5, -6.0, -5.5, -5.0, -4.5, -4.0, -3.5]
+  graph_label_weight_power: 0.5
+  graph_label_weight_clip: 3.0
 
 three_stage:
   stage1_lr: 5.0e-5
@@ -58,6 +67,16 @@ three_stage:
   stage3_warmup_epochs: 10
 
 search:
+  regression_label_transform:
+    - none
+    - winsorized_standardize
+
+  mt_loss_prior:
+    - null
+    - graph: 1.0
+      finger: 0.3
+      atom_fg: 0.1
+
   dist_bar:
     # Known good anchors retained
     - [20, 90]

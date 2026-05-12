@@ -369,7 +369,7 @@ def load_target_transform(ckpt_path: str) -> dict:
 def inverse_regression_target_transform(values: np.ndarray, transform: dict) -> np.ndarray:
     if not transform or transform.get('type') in [None, 'none', 'None']:
         return values
-    if transform.get('type') != 'standardize':
+    if transform.get('type') not in {'standardize', 'winsorized_standardize'}:
         raise ValueError(f"Unsupported target_transform: {transform}")
     mean = np.asarray(transform['mean'], dtype=np.float32).reshape(1, -1)
     std = np.asarray(transform['std'], dtype=np.float32).reshape(1, -1)

@@ -93,6 +93,11 @@ def parse_args():
     parser.add_argument("--num_heads", type=int, default=16)
     parser.add_argument("--minimal_outputs", type=int, default=1, choices=[0, 1],
                         help="1: keep model.pth + config_finetune.yaml + learning_curve.png + record.txt")
+    parser.add_argument(
+        "--resume_disk",
+        action="store_true",
+        help="If trial_dir already has trained model.pth, skip training and only re-run predict eval (for crash recovery).",
+    )
     return parser.parse_args()
 
 
@@ -189,6 +194,7 @@ class CustomTrainer(upstream.Trainer):
         self.regression_target_transform = self._build_regression_target_transform()
         self.last_mt_weights = None
         self.best_metadata = {}
+        self.graph_label_reweight_info = self._build_graph_label_reweight_info()
 
     def calc_dynamic_mt_loss(self, loss_list, update_state=True):
         loss_list = torch.stack(loss_list)
@@ -225,6 +231,19 @@ class CustomTrainer(upstream.Trainer):
         cur_loss_last2 = self.loss_last2[:, :last_cols].mean(dim=-1).clamp_min(eps)
         ratio = (cur_loss_last / cur_loss_last2).clamp(min=1.0 / ratio_clip, max=ratio_clip)
         weights = F.softmax(ratio / tau, dim=-1).detach()
+        prior = self.config.get("mt_loss_prior")
+        if prior is not None:
+            prior_tensor = torch.tensor(
+                [
+                    float(prior.get("graph", 1.0)),
+                    float(prior.get("finger", 1.0)),
+                    float(prior.get("atom_fg", 1.0)),
+                ],
+                dtype=weights.dtype,
+                device=weights.device,
+            )
+            weights = weights * prior_tensor
+            weights = weights / weights.sum().clamp_min(eps)
         self.last_mt_weights = weights.detach()
         total_loss = (loss_list / cur_loss_init * weights).sum()
 
@@ -262,7 +281,7 @@ class CustomTrainer(upstream.Trainer):
         transform_type = self.config.get("regression_label_transform", "none")
         if self.config["task"] != "regression" or transform_type in [None, "none", "None"]:
             return {"type": "none"}
-        if transform_type != "standardize":
+        if transform_type not in {"standardize", "winsorized_standardize"}:
             raise ValueError(f"Unsupported regression_label_transform: {transform_type}")
 
         labels = []
@@ -275,13 +294,31 @@ class CustomTrainer(upstream.Trainer):
             raise ValueError("Cannot compute regression label statistics from an empty training split.")
 
         label_tensor = torch.cat(labels, dim=0)
-        mean = label_tensor.mean(dim=0)
-        std = label_tensor.std(dim=0, unbiased=False).clamp_min(1e-6)
-        transform = {
-            "type": "standardize",
-            "mean": mean.tolist(),
-            "std": std.tolist(),
-        }
+        if transform_type == "winsorized_standardize":
+            q_low = float(self.config.get("winsorize_quantile_low", 0.01))
+            q_high = float(self.config.get("winsorize_quantile_high", 0.99))
+            low = torch.quantile(label_tensor, q_low, dim=0)
+            high = torch.quantile(label_tensor, q_high, dim=0)
+            clipped = torch.clamp(label_tensor, min=low, max=high)
+            mean = clipped.mean(dim=0)
+            std = clipped.std(dim=0, unbiased=False).clamp_min(1e-6)
+            transform = {
+                "type": "winsorized_standardize",
+                "mean": mean.tolist(),
+                "std": std.tolist(),
+                "low": low.tolist(),
+                "high": high.tolist(),
+                "q_low": q_low,
+                "q_high": q_high,
+            }
+        else:
+            mean = label_tensor.mean(dim=0)
+            std = label_tensor.std(dim=0, unbiased=False).clamp_min(1e-6)
+            transform = {
+                "type": "standardize",
+                "mean": mean.tolist(),
+                "std": std.tolist(),
+            }
         print(f"[INFO] regression_label_transform={transform}")
         write_record(self.txtfile, f"regression_label_transform:{transform}")
         return transform
@@ -292,18 +329,70 @@ class CustomTrainer(upstream.Trainer):
 
     def _transform_regression_label(self, label: Tensor) -> Tensor:
         label = label.view(-1, self.config["num_tasks"])
-        if self.regression_target_transform.get("type") != "standardize":
+        transform_type = self.regression_target_transform.get("type")
+        if transform_type == "none":
             return label
+        if transform_type == "winsorized_standardize":
+            low = self._target_stats_tensor("low", label)
+            high = self._target_stats_tensor("high", label)
+            label = torch.clamp(label, min=low, max=high)
         mean = self._target_stats_tensor("mean", label)
         std = self._target_stats_tensor("std", label)
         return (label - mean) / std
 
     def _inverse_regression_pred(self, pred: Tensor) -> Tensor:
-        if self.regression_target_transform.get("type") != "standardize":
+        transform_type = self.regression_target_transform.get("type")
+        if transform_type not in {"standardize", "winsorized_standardize"}:
             return pred
         mean = self._target_stats_tensor("mean", pred)
         std = self._target_stats_tensor("std", pred)
         return pred * std + mean
+
+    def _build_graph_label_reweight_info(self):
+        if self.config["task"] != "regression" or not self.config.get("graph_label_reweight", False):
+            return None
+
+        bins = torch.tensor(
+            self.config.get("graph_label_bins", [-8.0, -7.0, -6.5, -6.0, -5.5, -5.0, -4.5, -4.0, -3.5]),
+            dtype=torch.float32,
+        )
+        if bins.numel() < 2:
+            return None
+
+        labels = []
+        for batch in self.train_loader:
+            label = batch["label"].float().view(-1)
+            label = label[torch.isfinite(label)]
+            if label.numel() > 0:
+                labels.append(label.cpu())
+        if not labels:
+            return None
+
+        labels = torch.cat(labels, dim=0)
+        bin_idx = torch.bucketize(labels, bins) - 1
+        bin_idx = bin_idx.clamp(min=0, max=len(bins) - 2)
+        counts = torch.bincount(bin_idx, minlength=len(bins) - 1).float().clamp_min(1.0)
+
+        power = float(self.config.get("graph_label_weight_power", 0.5))
+        clip_value = float(self.config.get("graph_label_weight_clip", 3.0))
+        weights = counts.pow(-power)
+        weights = weights / weights.mean().clamp_min(1e-8)
+        weights = weights.clamp(max=clip_value)
+
+        info = {"bins": bins.tolist(), "weights": weights.tolist()}
+        write_record(self.txtfile, f"graph_label_reweight_info:{info}")
+        return info
+
+    def _graph_label_weights(self, raw_label: Tensor):
+        info = self.graph_label_reweight_info
+        if info is None:
+            return None
+        bins = torch.tensor(info["bins"], dtype=raw_label.dtype, device=raw_label.device)
+        weights = torch.tensor(info["weights"], dtype=raw_label.dtype, device=raw_label.device)
+        y = raw_label.float().view(-1)
+        bin_idx = torch.bucketize(y, bins) - 1
+        bin_idx = bin_idx.clamp(min=0, max=weights.numel() - 1)
+        return weights[bin_idx].view_as(raw_label)
 
     def _checkpoint_payload(self):
         payload = {
@@ -355,6 +444,7 @@ class CustomTrainer(upstream.Trainer):
                 "loss_weights": self.config.get("loss_weights"),
                 "mt_loss_tau": self.config.get("mt_loss_tau"),
                 "mt_ratio_clip": self.config.get("mt_ratio_clip"),
+                "mt_loss_prior": self.config.get("mt_loss_prior"),
                 "encoder_lr_ratio": self.config.get("encoder_lr_ratio"),
                 "max_grad_norm": self.config.get("max_grad_norm"),
             }
@@ -379,6 +469,7 @@ class CustomTrainer(upstream.Trainer):
             "loss_weights": self.config.get("loss_weights"),
             "mt_loss_tau": self.config.get("mt_loss_tau"),
             "mt_ratio_clip": self.config.get("mt_ratio_clip"),
+            "mt_loss_prior": self.config.get("mt_loss_prior"),
             "encoder_lr_ratio": self.config.get("encoder_lr_ratio"),
             "max_grad_norm": self.config.get("max_grad_norm"),
         }
@@ -495,8 +586,16 @@ class CustomTrainer(upstream.Trainer):
             )
             loss_graph = torch.sum(loss_graph) / torch.sum(is_valid)
         else:
-            label = self._transform_regression_label(batch["label"].float())
-            loss_graph = self.criterion(pred.view(label.shape), label)
+            raw_label = batch["label"].float().view(-1, self.config["num_tasks"])
+            label = self._transform_regression_label(raw_label)
+            pred_view = pred.view(label.shape)
+            loss_graph_element = F.mse_loss(pred_view, label, reduction="none")
+            sample_weights = self._graph_label_weights(raw_label)
+            if sample_weights is not None:
+                sample_weights = sample_weights.to(loss_graph_element.device).view_as(loss_graph_element)
+                loss_graph = (loss_graph_element * sample_weights).sum() / sample_weights.sum().clamp_min(1e-8)
+            else:
+                loss_graph = loss_graph_element.mean()
 
         total_loss = self.calc_mt_loss(
             [loss_graph, loss_finger, loss_atom_fg],
@@ -706,6 +805,7 @@ class CustomTrainer(upstream.Trainer):
         train_loss_list, valid_loss_list, test_loss_list = [], [], []
         train_metric_list, val_metric_list, test_metric_list = [], [], []
         train_r2_list, val_r2_list, test_r2_list = [], [], []
+        mt_weight_history = {"graph": [], "finger": [], "atom_fg": []}
         loss_part_keys = self._loss_part_keys()
         loss_part_history = {
             "train": {key: [] for key in loss_part_keys},
@@ -770,6 +870,12 @@ class CustomTrainer(upstream.Trainer):
                 loss_part_history["train"][key].append(train_parts[key])
                 loss_part_history["valid"][key].append(valid_parts[key])
                 loss_part_history["test"][key].append(test_parts[key])
+            mt_weights = self._mt_weights_dict()
+            for key in mt_weight_history:
+                if mt_weights is None:
+                    mt_weight_history[key].append(np.nan)
+                else:
+                    mt_weight_history[key].append(mt_weights.get(key, np.nan))
 
             if self._is_better(valid_select_metric, self.best_metric):
                 self.best_metric = valid_select_metric
@@ -827,7 +933,7 @@ class CustomTrainer(upstream.Trainer):
         self._save_learning_curve(
             epoch_list, train_loss_list, valid_loss_list, test_loss_list,
             train_metric_list, val_metric_list, test_metric_list,
-            loss_part_history, best_epoch, best_model_path,
+            loss_part_history, mt_weight_history, best_epoch, best_model_path,
             train_r2_list, val_r2_list, test_r2_list,
         )
         write_record(self.txtfile, f"best_epoch:{best_epoch}\tbest_model_path:{best_model_path}")
@@ -849,41 +955,62 @@ class CustomTrainer(upstream.Trainer):
 
     def _save_learning_curve(self, epoch_list, train_loss_list, valid_loss_list, test_loss_list,
                              train_metric_list, val_metric_list, test_metric_list,
-                             loss_part_history, best_epoch, best_model_path,
+                             loss_part_history, mt_weight_history, best_epoch, best_model_path,
                              train_r2_list, val_r2_list, test_r2_list):
         if not epoch_list:
             return
         save_path = os.path.join(self.writer.log_dir, "learning_curve.png")
-        fig, axes = plt.subplots(2, 2, figsize=(8, 5))
-        font_size = 5
-        title_size = 6
-        legend_size = 4
-        text_size = 4
-        line_width = 0.75
-        marker_line_width = 0.5
+        fig, axes = plt.subplots(3, 2, figsize=(13, 10))
+        font_size = 7
+        title_size = 9
+        legend_size = 6
+        text_size = 6
+        line_width = 1.0
+        marker_line_width = 0.8
 
         ax = axes[0, 0]
-        ax.plot(epoch_list, train_loss_list, label="train_loss", linewidth=line_width)
-        ax.plot(epoch_list, valid_loss_list, label="valid_loss", linewidth=line_width)
-        ax.plot(epoch_list, test_loss_list, label="test_loss", linewidth=line_width)
+        ax.plot(epoch_list, train_loss_list, label="train_dynamic_mt_loss", linewidth=line_width)
+        ax.plot(epoch_list, valid_loss_list, label="valid_dynamic_mt_loss", linewidth=line_width)
+        ax.plot(epoch_list, test_loss_list, label="test_dynamic_mt_loss", linewidth=line_width)
+        ax.plot(
+            epoch_list,
+            loss_part_history["train"]["raw_mean_loss"],
+            linestyle="--",
+            label="train_raw_mean_loss",
+            linewidth=line_width,
+        )
+        ax.plot(
+            epoch_list,
+            loss_part_history["valid"]["raw_mean_loss"],
+            linestyle="--",
+            label="valid_raw_mean_loss",
+            linewidth=line_width,
+        )
+        ax.plot(
+            epoch_list,
+            loss_part_history["test"]["raw_mean_loss"],
+            linestyle="--",
+            label="test_raw_mean_loss",
+            linewidth=line_width,
+        )
         if best_epoch is not None:
             ax.axvline(best_epoch, linestyle="--", color="black", linewidth=marker_line_width, label=f"best_epoch={best_epoch}")
         ax.set_xlabel("Epoch", fontsize=font_size)
-        ax.set_ylabel("Loss", fontsize=font_size)
-        ax.set_title("Total Loss Curve", fontsize=title_size)
+        ax.set_ylabel("Loss value", fontsize=font_size)
+        ax.set_title("Dynamic MT Loss vs Raw Mean Loss", fontsize=title_size)
         ax.tick_params(axis="both", labelsize=font_size)
-        ax.legend(fontsize=legend_size)
+        ax.legend(fontsize=legend_size, ncol=2)
 
         ax = axes[0, 1]
         for split_name, style in [("train", "-"), ("valid", "--"), ("test", ":")]:
-            for part_name in ["graph_loss", "finger_loss", "atom_fg_loss"]:
+            for part_name in ["graph_loss", "finger_loss", "atom_fg_loss", "raw_total_loss"]:
                 ax.plot(epoch_list, loss_part_history[split_name][part_name],
                         linestyle=style, label=f"{split_name}_{part_name}", linewidth=line_width)
         if best_epoch is not None:
             ax.axvline(best_epoch, linestyle="--", color="black", linewidth=marker_line_width)
         ax.set_xlabel("Epoch", fontsize=font_size)
-        ax.set_ylabel("Loss Component", fontsize=font_size)
-        ax.set_title("Detailed Loss Components", fontsize=title_size)
+        ax.set_ylabel("Raw loss component", fontsize=font_size)
+        ax.set_title("Raw Loss Components", fontsize=title_size)
         ax.tick_params(axis="both", labelsize=font_size)
         ax.legend(fontsize=legend_size, ncol=2)
 
@@ -896,22 +1023,53 @@ class CustomTrainer(upstream.Trainer):
             ax.axvline(best_epoch, linestyle="--", color="black", linewidth=marker_line_width)
         ax.set_xlabel("Epoch", fontsize=font_size)
         ax.set_ylabel(primary_label, fontsize=font_size)
-        ax.set_title(f"{primary_label} Curve", fontsize=title_size)
+        if self.config["task"] == "regression":
+            ax.set_title("RMSE Curve: model selection uses valid_RMSE", fontsize=title_size)
+        else:
+            ax.set_title(f"{primary_label} Curve", fontsize=title_size)
         ax.tick_params(axis="both", labelsize=font_size)
         ax.legend(fontsize=legend_size)
 
         ax = axes[1, 1]
         if self.config["task"] == "regression":
-            ax.plot(epoch_list, train_r2_list, label="train_r2", linewidth=line_width)
-            ax.plot(epoch_list, val_r2_list, label="valid_r2", linewidth=line_width)
-            ax.plot(epoch_list, test_r2_list, label="test_r2", linewidth=line_width)
+            ax.plot(epoch_list, train_r2_list, label="train_R2", linewidth=line_width)
+            ax.plot(epoch_list, val_r2_list, label="valid_R2", linewidth=line_width)
+            ax.plot(epoch_list, test_r2_list, label="test_R2", linewidth=line_width)
             ax.set_ylabel("R2", fontsize=font_size)
-            ax.set_title("R2 Curve", fontsize=title_size)
+            ax.set_title("R2 Curve: reference only", fontsize=title_size)
         else:
             gap = np.array(valid_loss_list) - np.array(train_loss_list)
             ax.plot(epoch_list, gap, label="valid_loss - train_loss", linewidth=line_width)
             ax.set_ylabel("Loss Gap", fontsize=font_size)
-            ax.set_title("Overfit Gap", fontsize=title_size)
+            ax.set_title("Generalization Gap", fontsize=title_size)
+        if best_epoch is not None:
+            ax.axvline(best_epoch, linestyle="--", color="black", linewidth=marker_line_width)
+        ax.set_xlabel("Epoch", fontsize=font_size)
+        ax.tick_params(axis="both", labelsize=font_size)
+        ax.legend(fontsize=legend_size)
+
+        ax = axes[2, 0]
+        for key in ["graph", "finger", "atom_fg"]:
+            ax.plot(epoch_list, mt_weight_history[key], label=f"mt_weight_{key}", linewidth=line_width)
+        if best_epoch is not None:
+            ax.axvline(best_epoch, linestyle="--", color="black", linewidth=marker_line_width)
+        ax.set_xlabel("Epoch", fontsize=font_size)
+        ax.set_ylabel("Dynamic MT weight", fontsize=font_size)
+        ax.set_title("Dynamic Multi-task Weights", fontsize=title_size)
+        ax.tick_params(axis="both", labelsize=font_size)
+        ax.legend(fontsize=legend_size)
+
+        ax = axes[2, 1]
+        if self.config["task"] == "regression":
+            gap = np.array(val_metric_list) - np.array(train_metric_list)
+            ax.plot(epoch_list, gap, label="valid_RMSE - train_RMSE", linewidth=line_width)
+            ax.set_ylabel("RMSE gap", fontsize=font_size)
+            ax.set_title("Generalization Gap", fontsize=title_size)
+        else:
+            gap = np.array(valid_loss_list) - np.array(train_loss_list)
+            ax.plot(epoch_list, gap, label="valid_loss - train_loss", linewidth=line_width)
+            ax.set_ylabel("Loss gap", fontsize=font_size)
+            ax.set_title("Generalization Gap", fontsize=title_size)
         if best_epoch is not None:
             ax.axvline(best_epoch, linestyle="--", color="black", linewidth=marker_line_width)
         ax.text(0.02, 0.02, f"best_model_path:\n{best_model_path}",
@@ -920,9 +1078,9 @@ class CustomTrainer(upstream.Trainer):
         ax.tick_params(axis="both", labelsize=font_size)
         ax.legend(fontsize=legend_size)
 
-        plt.tight_layout()
-        plt.savefig(save_path, dpi=200)
-        plt.close()
+        fig.tight_layout()
+        fig.savefig(save_path, dpi=300)
+        plt.close(fig)
         print(f"learning_curve_saved:{save_path}")
 
 
@@ -1005,6 +1163,15 @@ def build_config(base_args, trial, trainable_scope, checkpoint):
     config["mt_loss_eps"] = trial.get("mt_loss_eps", 1e-8)
     config["mt_loss_tau"] = trial.get("mt_loss_tau", 2.0)
     config["mt_ratio_clip"] = trial.get("mt_ratio_clip", 5.0)
+    config["mt_loss_prior"] = trial.get("mt_loss_prior", None)
+    config["winsorize_quantile_low"] = trial.get("winsorize_quantile_low", 0.01)
+    config["winsorize_quantile_high"] = trial.get("winsorize_quantile_high", 0.99)
+    config["graph_label_reweight"] = trial.get("graph_label_reweight", False)
+    config["graph_label_bins"] = trial.get(
+        "graph_label_bins", [-8.0, -7.0, -6.5, -6.0, -5.5, -5.0, -4.5, -4.0, -3.5]
+    )
+    config["graph_label_weight_power"] = trial.get("graph_label_weight_power", 0.5)
+    config["graph_label_weight_clip"] = trial.get("graph_label_weight_clip", 3.0)
     config["pretrain_model_path"] = "None"
     config = get_downstream_task_names(config)
     set_seed(config["seed"])
@@ -1094,6 +1261,15 @@ def build_trials(cfg, default_dist_bar):
         "mt_loss_eps": fixed.get("mt_loss_eps", 1e-8),
         "mt_loss_tau": fixed.get("mt_loss_tau", 2.0),
         "mt_ratio_clip": fixed.get("mt_ratio_clip", 5.0),
+        "mt_loss_prior": fixed.get("mt_loss_prior", None),
+        "winsorize_quantile_low": fixed.get("winsorize_quantile_low", 0.01),
+        "winsorize_quantile_high": fixed.get("winsorize_quantile_high", 0.99),
+        "graph_label_reweight": fixed.get("graph_label_reweight", False),
+        "graph_label_bins": fixed.get(
+            "graph_label_bins", [-8.0, -7.0, -6.5, -6.0, -5.5, -5.0, -4.5, -4.0, -3.5]
+        ),
+        "graph_label_weight_power": fixed.get("graph_label_weight_power", 0.5),
+        "graph_label_weight_clip": fixed.get("graph_label_weight_clip", 3.0),
         "stage2_warmup_epochs": three_stage.get("stage2_warmup_epochs", fixed.get("warm_up_epoch", 5)),
         "stage3_warmup_epochs": three_stage.get("stage3_warmup_epochs", fixed.get("warm_up_epoch", 5)),
         "stage1_loss_weights": fixed.get(
@@ -1135,6 +1311,107 @@ def eval_settings(args, trial):
         "result_dir": args.result_dir,
         "pkl_dir": args.dataroot,
         "split_root": str(split_root),
+    }
+
+
+def try_resume_trial_from_disk(
+    idx: int,
+    trial_cfg: Dict,
+    trial_dir: Path,
+    args,
+    project_root: Path,
+    py: str,
+    pkl_dir: Path,
+    split_root: Path,
+):
+    """Rebuild one trial candidate from checkpoints if training already finished on disk."""
+    trial_dir = Path(trial_dir)
+    eval_args = settings_namespace(eval_settings(args, trial_cfg))
+
+    if args.single_stage:
+        candidate_model = trial_dir / "single" / "model.pth"
+        if not candidate_model.is_file():
+            return None
+        stage1_model = stage2_model = None
+        stage1_valid_metric = stage1_test_metric = None
+        stage2_valid_metric = stage2_test_metric = None
+        stage1_tag = stage2_tag = stage3_tag = None
+        final_tag = "single"
+        valid_metric = run_predict_eval_metrics_only(
+            py, project_root, eval_args, pkl_dir, split_root, candidate_model, "valid"
+        )
+        test_metric = run_predict_eval_metrics_only(
+            py, project_root, eval_args, pkl_dir, split_root, candidate_model, "test"
+        )
+        return {
+            "idx": idx,
+            "trial_dir": str(trial_dir),
+            "run_tag": final_tag,
+            "model": str(candidate_model),
+            "stage1_run_tag": stage1_tag,
+            "stage2_run_tag": stage2_tag,
+            "stage3_run_tag": stage3_tag,
+            "stage1_model": stage1_model,
+            "stage2_model": stage2_model,
+            "stage3_model": None,
+            "params": {**trial_cfg, "single_stage": args.single_stage},
+            "stage1_valid": stage1_valid_metric,
+            "stage1_test": stage1_test_metric,
+            "stage2_valid": stage2_valid_metric,
+            "stage2_test": stage2_test_metric,
+            "valid": valid_metric,
+            "test": test_metric,
+        }
+
+    stage1_model = trial_dir / "stage1" / "model.pth"
+    stage2_model = trial_dir / "stage2" / "model.pth"
+    stage3_model = trial_dir / "stage3" / "model.pth"
+    if not (stage1_model.is_file() and stage2_model.is_file() and stage3_model.is_file()):
+        return None
+
+    stage1_tag = "stage1"
+    stage2_tag = "stage2"
+    stage3_tag = "stage3"
+    final_tag = stage3_tag
+    candidate_model = stage3_model
+
+    stage1_valid_metric = run_predict_eval_metrics_only(
+        py, project_root, eval_args, pkl_dir, split_root, stage1_model, "valid"
+    )
+    stage1_test_metric = run_predict_eval_metrics_only(
+        py, project_root, eval_args, pkl_dir, split_root, stage1_model, "test"
+    )
+    stage2_valid_metric = run_predict_eval_metrics_only(
+        py, project_root, eval_args, pkl_dir, split_root, stage2_model, "valid"
+    )
+    stage2_test_metric = run_predict_eval_metrics_only(
+        py, project_root, eval_args, pkl_dir, split_root, stage2_model, "test"
+    )
+    valid_metric = run_predict_eval_metrics_only(
+        py, project_root, eval_args, pkl_dir, split_root, candidate_model, "valid"
+    )
+    test_metric = run_predict_eval_metrics_only(
+        py, project_root, eval_args, pkl_dir, split_root, candidate_model, "test"
+    )
+
+    return {
+        "idx": idx,
+        "trial_dir": str(trial_dir),
+        "run_tag": final_tag,
+        "model": str(candidate_model),
+        "stage1_run_tag": stage1_tag,
+        "stage2_run_tag": stage2_tag,
+        "stage3_run_tag": stage3_tag,
+        "stage1_model": str(stage1_model),
+        "stage2_model": str(stage2_model),
+        "stage3_model": str(candidate_model),
+        "params": {**trial_cfg, "single_stage": args.single_stage},
+        "stage1_valid": stage1_valid_metric,
+        "stage1_test": stage1_test_metric,
+        "stage2_valid": stage2_valid_metric,
+        "stage2_test": stage2_test_metric,
+        "valid": valid_metric,
+        "test": test_metric,
     }
 
 
@@ -1190,6 +1467,39 @@ def main():
         )
         tqdm.write(f"\n[Trial {idx}/{len(trials)}] {trial_name} started")
         eval_args = settings_namespace(eval_settings(args, trial_cfg))
+        if args.resume_disk:
+            resumed_candidate = try_resume_trial_from_disk(
+                idx, trial_cfg, trial_dir, args, project_root, py, pkl_dir, split_root
+            )
+            if resumed_candidate is not None:
+                valid_metric = resumed_candidate["valid"]
+                test_metric = resumed_candidate["test"]
+                final_metric_name = predict_primary_metric_name(valid_metric)
+                tqdm.write(
+                    f"[Trial {idx}/{len(trials)}] resume_disk | re-eval | "
+                    f"valid_{final_metric_name}={valid_metric.get(final_metric_name):.6f} | "
+                    f"test_{final_metric_name}={test_metric.get(final_metric_name):.6f} | "
+                    f"model={resumed_candidate['model']}"
+                )
+                task_type = valid_metric["task_type"]
+                primary_name = predict_primary_metric_name(valid_metric)
+                primary_value = valid_metric.get(primary_name)
+                candidates.append(resumed_candidate)
+                display_metric_name = primary_name
+                display_metric_value = primary_value
+                tqdm.write(
+                    f"[Trial {idx}/{len(trials)}] completed | "
+                    f"valid_{display_metric_name}={display_metric_value:.6f} | model={resumed_candidate['model']}"
+                )
+                if metric_is_better(task_type, primary_value, best_metric):
+                    best_metric = primary_value
+                    best_model = Path(resumed_candidate["model"])
+                    best_candidate = resumed_candidate
+                    tqdm.write(
+                        f"[Trial {idx}/{len(trials)}] new best | "
+                        f"valid_{display_metric_name}={display_metric_value:.6f}"
+                    )
+                continue
         stage1_model = None
         stage1_valid_metric = None
         stage1_test_metric = None
@@ -1227,7 +1537,16 @@ def main():
                 "mt_loss_eps": trial_cfg.get("mt_loss_eps", 1e-8),
                 "mt_loss_tau": trial_cfg.get("mt_loss_tau", 2.0),
                 "mt_ratio_clip": trial_cfg.get("mt_ratio_clip", 5.0),
+                "mt_loss_prior": trial_cfg.get("mt_loss_prior", None),
                 "regression_label_transform": trial_cfg.get("regression_label_transform", "none"),
+                "winsorize_quantile_low": trial_cfg.get("winsorize_quantile_low", 0.01),
+                "winsorize_quantile_high": trial_cfg.get("winsorize_quantile_high", 0.99),
+                "graph_label_reweight": trial_cfg.get("graph_label_reweight", False),
+                "graph_label_bins": trial_cfg.get(
+                    "graph_label_bins", [-8.0, -7.0, -6.5, -6.0, -5.5, -5.0, -4.5, -4.0, -3.5]
+                ),
+                "graph_label_weight_power": trial_cfg.get("graph_label_weight_power", 0.5),
+                "graph_label_weight_clip": trial_cfg.get("graph_label_weight_clip", 3.0),
                 "dist_bar": trial_cfg["dist_bar"],
             }
             save_trial_params(trial_dir, args, trial_cfg, {"single": stage2_trial})
@@ -1262,7 +1581,16 @@ def main():
                 "mt_loss_eps": trial_cfg.get("mt_loss_eps", 1e-8),
                 "mt_loss_tau": trial_cfg.get("mt_loss_tau", 2.0),
                 "mt_ratio_clip": trial_cfg.get("mt_ratio_clip", 5.0),
+                "mt_loss_prior": trial_cfg.get("mt_loss_prior", None),
                 "regression_label_transform": trial_cfg.get("regression_label_transform", "none"),
+                "winsorize_quantile_low": trial_cfg.get("winsorize_quantile_low", 0.01),
+                "winsorize_quantile_high": trial_cfg.get("winsorize_quantile_high", 0.99),
+                "graph_label_reweight": trial_cfg.get("graph_label_reweight", False),
+                "graph_label_bins": trial_cfg.get(
+                    "graph_label_bins", [-8.0, -7.0, -6.5, -6.0, -5.5, -5.0, -4.5, -4.0, -3.5]
+                ),
+                "graph_label_weight_power": trial_cfg.get("graph_label_weight_power", 0.5),
+                "graph_label_weight_clip": trial_cfg.get("graph_label_weight_clip", 3.0),
                 "dist_bar": trial_cfg["dist_bar"],
             }
             save_trial_params(trial_dir, args, trial_cfg, {"stage1": stage1_trial})
@@ -1307,7 +1635,16 @@ def main():
                 "mt_loss_eps": trial_cfg.get("mt_loss_eps", 1e-8),
                 "mt_loss_tau": trial_cfg.get("mt_loss_tau", 2.0),
                 "mt_ratio_clip": trial_cfg.get("mt_ratio_clip", 5.0),
+                "mt_loss_prior": trial_cfg.get("mt_loss_prior", None),
                 "regression_label_transform": trial_cfg.get("regression_label_transform", "none"),
+                "winsorize_quantile_low": trial_cfg.get("winsorize_quantile_low", 0.01),
+                "winsorize_quantile_high": trial_cfg.get("winsorize_quantile_high", 0.99),
+                "graph_label_reweight": trial_cfg.get("graph_label_reweight", False),
+                "graph_label_bins": trial_cfg.get(
+                    "graph_label_bins", [-8.0, -7.0, -6.5, -6.0, -5.5, -5.0, -4.5, -4.0, -3.5]
+                ),
+                "graph_label_weight_power": trial_cfg.get("graph_label_weight_power", 0.5),
+                "graph_label_weight_clip": trial_cfg.get("graph_label_weight_clip", 3.0),
                 "dist_bar": trial_cfg["dist_bar"],
             }
             save_trial_params(trial_dir, args, trial_cfg, {"stage1": stage1_trial, "stage2": stage2_trial})
@@ -1353,7 +1690,16 @@ def main():
                 "mt_loss_eps": trial_cfg.get("mt_loss_eps", 1e-8),
                 "mt_loss_tau": trial_cfg.get("mt_loss_tau", 2.0),
                 "mt_ratio_clip": trial_cfg.get("mt_ratio_clip", 5.0),
+                "mt_loss_prior": trial_cfg.get("mt_loss_prior", None),
                 "regression_label_transform": trial_cfg.get("regression_label_transform", "none"),
+                "winsorize_quantile_low": trial_cfg.get("winsorize_quantile_low", 0.01),
+                "winsorize_quantile_high": trial_cfg.get("winsorize_quantile_high", 0.99),
+                "graph_label_reweight": trial_cfg.get("graph_label_reweight", False),
+                "graph_label_bins": trial_cfg.get(
+                    "graph_label_bins", [-8.0, -7.0, -6.5, -6.0, -5.5, -5.0, -4.5, -4.0, -3.5]
+                ),
+                "graph_label_weight_power": trial_cfg.get("graph_label_weight_power", 0.5),
+                "graph_label_weight_clip": trial_cfg.get("graph_label_weight_clip", 3.0),
                 "dist_bar": trial_cfg["dist_bar"],
             }
             save_trial_params(
