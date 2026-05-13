@@ -1,11 +1,13 @@
 import json
 import os
 import pickle
+import random
 import re
 import shutil
 import subprocess
 import sys
 import tempfile
+from collections import defaultdict
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -14,7 +16,7 @@ import pandas as pd
 import yaml
 
 from _config import task_configs
-from prepare_data import ScaffoldSplitter
+from prepare_data import ScaffoldSplitter, generate_scaffold
 
 
 def run_cmd(cmd, cwd, print_cmd=True):
@@ -110,7 +112,7 @@ def load_pipeline_settings(project_root: Path, args=None):
         "two_stage": two_stage_cfg,
         "search": search_cfg,
     }
-    if settings["split_type"] not in {"scaffold", "random_scaffold"}:
+    if settings["split_type"] not in {"scaffold", "random_scaffold", "cyclic_scaffold"}:
         raise ValueError(f"Unsupported split_type: {settings['split_type']}")
     print(f"[INFO] Pipeline config loaded: {cfg_path}")
     return settings
@@ -125,6 +127,8 @@ def settings_namespace(settings):
         num_workers=settings["dataloader_num_workers"],
         gpus=settings["gpus"],
         result_dir=settings["result_dir"],
+        split_pkl_path=settings.get("split_pkl_path"),
+        allow_empty_test=bool(settings.get("allow_empty_test", False)),
     )
 
 
@@ -176,11 +180,129 @@ def build_random_scaffold_split(task_name: str, split_root: Path, smiles_list, s
     return split_path
 
 
-def get_split_path(split_root: Path, task_name: str, split_type: str, seed: int):
+def build_cyclic_scaffold_split(
+    task_name: str,
+    split_root: Path,
+    smiles_list,
+    seed: int,
+    valid_ratio: float = 0.1,
+    test_ratio: float = 0.1,
+    output_split_pkl: Path = None,
+    chunk_size: int = 10,
+):
+    if valid_ratio <= 0:
+        raise ValueError("valid_ratio must be > 0 because model selection needs validation set.")
+    if test_ratio < 0:
+        raise ValueError("test_ratio must be >= 0.")
+    if chunk_size <= 1:
+        raise ValueError("chunk_size must be > 1.")
+
+    scaffold_to_indices = defaultdict(list)
+    for idx, smiles in enumerate(smiles_list):
+        scaffold_to_indices[generate_scaffold(smiles, include_chirality=False)].append(idx)
+
+    grouped_by_size = defaultdict(list)
+    for scaffold_set in scaffold_to_indices.values():
+        grouped_by_size[len(scaffold_set)].append(sorted(scaffold_set))
+
+    rng = random.Random(seed)
+    all_scaffold_sets = []
+    for size in sorted(grouped_by_size.keys(), reverse=True):
+        group = grouped_by_size[size]
+        rng.shuffle(group)
+        all_scaffold_sets.extend(group)
+
+    train_idx, valid_idx, test_idx = [], [], []
+    for chunk_index, start in enumerate(range(0, len(all_scaffold_sets), chunk_size)):
+        chunk = list(all_scaffold_sets[start:start + chunk_size])
+        if not chunk:
+            continue
+        chunk_rng = random.Random(seed + chunk_index)
+        chunk_rng.shuffle(chunk)
+        if test_ratio == 0:
+            valid_sets = chunk[:1]
+            test_sets = []
+            train_sets = chunk[1:]
+        else:
+            valid_sets = chunk[:1]
+            test_sets = chunk[1:2]
+            train_sets = chunk[2:]
+
+        for scaffold_set in train_sets:
+            train_idx.extend(scaffold_set)
+        for scaffold_set in valid_sets:
+            valid_idx.extend(scaffold_set)
+        for scaffold_set in test_sets:
+            test_idx.extend(scaffold_set)
+
+    if test_ratio == 0:
+        test_idx = []
+
+    n_total = len(smiles_list)
+    split_dict = {
+        "train_idx": sorted(train_idx),
+        "valid_idx": sorted(valid_idx),
+        "test_idx": sorted(test_idx),
+        "meta": {
+            "task": task_name,
+            "split_type": "cyclic_scaffold",
+            "seed": seed,
+            "valid_ratio": valid_ratio,
+            "test_ratio": test_ratio,
+            "chunk_size": chunk_size,
+            "n_total": n_total,
+            "n_train": len(train_idx),
+            "n_valid": len(valid_idx),
+            "n_test": len(test_idx),
+            "actual_val_ratio": len(valid_idx) / n_total if n_total else 0.0,
+            "actual_test_ratio": len(test_idx) / n_total if n_total else 0.0,
+            "assignment_rule": (
+                "chunk_size=10; shuffle each chunk by seed+chunk_index; "
+                "test_ratio=0 -> 1 valid + rest train; "
+                "test_ratio>0 -> 1 valid + 1 test + rest train"
+            ),
+        },
+    }
+
+    if output_split_pkl is None:
+        output_split_pkl = get_split_path(
+            split_root,
+            task_name,
+            "cyclic_scaffold",
+            seed,
+            valid_ratio=valid_ratio,
+            test_ratio=test_ratio,
+        )
+    output_split_pkl = Path(output_split_pkl)
+    output_split_pkl.parent.mkdir(parents=True, exist_ok=True)
+    with open(output_split_pkl, "wb") as f:
+        pickle.dump(split_dict, f)
+
+    print("[STEP 2] cyclic scaffold split summary")
+    print(split_dict["meta"])
+    print(f"[STEP 2] Saved split: {output_split_pkl}")
+    return output_split_pkl
+
+
+def get_split_path(
+    split_root: Path,
+    task_name: str,
+    split_type: str,
+    seed: int,
+    valid_ratio: float = 0.1,
+    test_ratio: float = 0.1,
+):
     if split_type == "scaffold":
         return split_root / "split" / "scaffold" / f"{task_name}.pkl"
     if split_type == "random_scaffold":
         return split_root / "split" / "random_scaffold" / f"{task_name}_{seed}.pkl"
+    if split_type == "cyclic_scaffold":
+        return (
+            split_root
+            / "split"
+            / "cyclic_scaffold"
+            / f"{task_name}_cyclic_scaffold_seed{seed}_v{valid_ratio:.2f}_t{test_ratio:.2f}.pkl"
+        )
     raise ValueError(f"Unsupported split_type: {split_type}")
 
 
@@ -229,27 +351,38 @@ def parse_predict_metrics(output_text: str):
 
 def run_predict_eval_metrics_only(py, project_root: Path, args, pkl_dir: Path, split_root: Path,
                                   final_weights: Path, split_name: str):
+    if split_name == "test" and getattr(args, "allow_empty_test", False):
+        return {
+            "task_type": "regression",
+            "primary_metric": "rmse",
+            "mae": None,
+            "rmse": None,
+            "r2": None,
+        }
     result_dir = (project_root / args.result_dir).resolve()
     result_dir.mkdir(parents=True, exist_ok=True)
     fd, tmp_output = tempfile.mkstemp(prefix=f"{args.task}_{split_name}_", suffix=".csv", dir=str(result_dir))
     os.close(fd)
     try:
+        cmd = [
+            py, "predict_mpp.py",
+            "--mode", "eval",
+            "--task", args.task,
+            "--dataroot", str(pkl_dir),
+            "--splitroot", str(split_root / "split"),
+            "--split_type", args.split_type,
+            "--split_seed", str(args.seed),
+            "--eval_split", split_name,
+            "--ckpt", str(final_weights),
+            "--batch_size", str(args.batch_size),
+            "--dataloader_num_workers", str(args.num_workers),
+            "--gpus", str(args.gpus),
+            "--output", str(tmp_output),
+        ]
+        if getattr(args, "split_pkl_path", None):
+            cmd.extend(["--split_pkl_path", str(args.split_pkl_path)])
         out = run_cmd(
-            [
-                py, "predict_mpp.py",
-                "--mode", "eval",
-                "--task", args.task,
-                "--dataroot", str(pkl_dir),
-                "--splitroot", str(split_root / "split"),
-                "--split_type", args.split_type,
-                "--split_seed", str(args.seed),
-                "--eval_split", split_name,
-                "--ckpt", str(final_weights),
-                "--batch_size", str(args.batch_size),
-                "--dataloader_num_workers", str(args.num_workers),
-                "--gpus", str(args.gpus),
-                "--output", str(tmp_output),
-            ],
+            cmd,
             cwd=project_root,
             print_cmd=False,
         )

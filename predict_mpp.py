@@ -407,14 +407,19 @@ def load_precomputed_subset(
         split_type: str,
         task_name: str,
         seed: int,
+        split_pkl_path: str = None,
         split_part: str = 'test') -> Subset:
     """Load a precomputed split index file and return the target subset."""
-    if split_type == 'scaffold':
+    if split_pkl_path:
+        split_path = Path(split_pkl_path)
+    elif split_type == 'scaffold':
         split_path = Path(splitroot) / 'scaffold' / f'{task_name}.pkl'
     elif split_type == 'random_scaffold':
         # Flat layout (aligned with 2_data_split.py):
         #   split/random_scaffold/<task>_<seed>.pkl
         split_path = Path(splitroot) / 'random_scaffold' / f'{task_name}_{seed}.pkl'
+    elif split_type == 'cyclic_scaffold':
+        split_path = Path(splitroot) / 'cyclic_scaffold' / f'{task_name}_cyclic_scaffold_seed{seed}_v0.10_t0.10.pkl'
     else:
         raise ValueError(f'Unsupported split_type: {split_type}')
 
@@ -543,6 +548,13 @@ def run_inference(model: nn.Module, loader: DataLoader,
     labels : np.ndarray or None
         Ground-truth labels if ``has_labels`` is True, else None.
     """
+    if len(loader.dataset) == 0:
+        empty_preds = np.empty((0, 0), dtype=float)
+        empty_labels = np.empty((0, 0), dtype=float) if has_labels else None
+        if return_raw:
+            return smiles_source, empty_preds, empty_labels, empty_preds
+        return smiles_source, empty_preds, empty_labels
+
     all_preds:  List[np.ndarray] = []
     all_raw:    List[np.ndarray] = []
     all_labels: List[np.ndarray] = []
@@ -716,10 +728,12 @@ def parse_args():
                         help='PKL dataset directory (eval mode)')
     parser.add_argument('--splitroot', type=str, default='./data/mpp/split/',
                         help='Split directory (eval mode)')
-    parser.add_argument('--split_type', choices=['scaffold', 'random_scaffold'],
+    parser.add_argument('--split_type', choices=['scaffold', 'random_scaffold', 'cyclic_scaffold'],
                         default='scaffold', help='Split strategy for eval mode')
     parser.add_argument('--split_seed', type=int, default=8,
                         help='Seed for random_scaffold generated split (default: 8)')
+    parser.add_argument('--split_pkl_path', type=str, default=None,
+                        help='Optional explicit split pickle path for eval mode')
     parser.add_argument('--apply_split', action='store_true',
                         help='Apply generated split to pkl-infer/csv-eval/infer modes')
     parser.add_argument('--eval_split', choices=['train', 'valid', 'test'],
@@ -819,6 +833,7 @@ def main(base_config: dict):
             split_type=base_config['split_type'],
             task_name=base_config['task_name'],
             seed=base_config['seed'],
+            split_pkl_path=args.split_pkl_path,
             split_part=args.eval_split
         )
 

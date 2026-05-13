@@ -11,6 +11,7 @@ from pathlib import Path
 import pandas as pd
 
 from utils.caco2_pipeline_utils import (
+    build_cyclic_scaffold_split,
     build_random_scaffold_split,
     build_scaffold_split,
     get_split_path,
@@ -21,10 +22,18 @@ from utils.caco2_pipeline_utils import (
 def parse_args():
     parser = argparse.ArgumentParser(description="Step 2: create data split")
     parser.add_argument("--task", type=str, required=True)
-    parser.add_argument("--split_type", type=str, default="random_scaffold", choices=["scaffold", "random_scaffold"])
+    parser.add_argument(
+        "--split_type",
+        type=str,
+        default="random_scaffold",
+        choices=["scaffold", "random_scaffold", "cyclic_scaffold"],
+    )
     parser.add_argument("--seed", type=int, default=8)
     parser.add_argument("--raw_dir", type=str, default="./data/mpp/raw")
     parser.add_argument("--split_root", type=str, default="./data/mpp")
+    parser.add_argument("--valid_ratio", type=float, default=0.1)
+    parser.add_argument("--test_ratio", type=float, default=0.1)
+    parser.add_argument("--output_split_pkl", type=str, default=None)
     parser.add_argument("--force_rebuild_split", action="store_true")
     return parser.parse_args()
 
@@ -40,7 +49,17 @@ def main():
     if not normalized_csv.exists():
         raise FileNotFoundError(f"找不到 normalized CSV，請先執行 1_csv_to_pkl.py: {normalized_csv}")
 
-    split_pkl = get_split_path(split_root, task, args.split_type, args.seed)
+    if args.output_split_pkl:
+        split_pkl = resolve_path(project_root, args.output_split_pkl)
+    else:
+        split_pkl = get_split_path(
+            split_root,
+            task,
+            args.split_type,
+            args.seed,
+            valid_ratio=args.valid_ratio,
+            test_ratio=args.test_ratio,
+        )
     if split_pkl.exists() and not args.force_rebuild_split:
         print(f"[STEP 2] Skip split build (exists): {split_pkl}")
     else:
@@ -50,13 +69,25 @@ def main():
         print(f"[STEP 2] Build {args.split_type} split")
         if args.split_type == "scaffold":
             split_pkl = build_scaffold_split(task, split_root, df["smiles"].tolist())
-        else:
+        elif args.split_type == "random_scaffold":
             split_pkl = build_random_scaffold_split(
                 task,
                 split_root,
                 df["smiles"].tolist(),
                 args.seed,
             )
+        elif args.split_type == "cyclic_scaffold":
+            split_pkl = build_cyclic_scaffold_split(
+                task,
+                split_root,
+                df["smiles"].tolist(),
+                args.seed,
+                valid_ratio=args.valid_ratio,
+                test_ratio=args.test_ratio,
+                output_split_pkl=split_pkl,
+            )
+        else:
+            raise ValueError(f"Unsupported split_type: {args.split_type}")
 
     print("\n=== Step 2 Completed ===")
     print(f"Split: {split_pkl}")

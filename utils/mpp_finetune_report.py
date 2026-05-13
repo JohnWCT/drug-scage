@@ -29,6 +29,13 @@ def _metadata_metric_columns(metadata: Dict[str, Any]) -> Dict[str, Any]:
         "selection_metric": metadata.get("selection_metric"),
         "best_epoch": metadata.get("best_epoch"),
         "best_valid_metric": metadata.get("best_valid_metric"),
+        "has_test_set": metadata.get("has_test_set"),
+        "metadata_split_pkl_path": metadata.get("split_pkl_path"),
+        "metadata_encoder_lr_ratio": metadata.get("encoder_lr_ratio"),
+        "metadata_max_grad_norm": metadata.get("max_grad_norm"),
+        "metadata_mt_loss_tau": metadata.get("mt_loss_tau"),
+        "metadata_mt_ratio_clip": metadata.get("mt_ratio_clip"),
+        "metadata_mt_loss_prior": json.dumps(metadata.get("mt_loss_prior"), ensure_ascii=False),
     }
     if metadata.get("selection_metric") == "valid_auc":
         row.update({
@@ -59,6 +66,38 @@ def flatten_metric(prefix: str, metric: Optional[Dict[str, Any]]) -> Dict[str, A
         if key not in {"task_type", "primary_metric"}:
             row[f"{prefix}_{key}"] = value
     return row
+
+
+def _json_or_none(value: Any) -> Optional[str]:
+    return json.dumps(value, ensure_ascii=False) if value is not None else None
+
+
+def _hidden_param_columns(params: Dict[str, Any]) -> Dict[str, Any]:
+    return {
+        "split_pkl_path": params.get("split_pkl_path"),
+        "allow_empty_test": params.get("allow_empty_test"),
+        "encoder_lr_ratio": params.get("encoder_lr_ratio"),
+        "max_grad_norm": params.get("max_grad_norm"),
+        "mt_loss_eps": params.get("mt_loss_eps"),
+        "mt_loss_tau": params.get("mt_loss_tau"),
+        "mt_ratio_clip": params.get("mt_ratio_clip"),
+        "mt_loss_prior": _json_or_none(params.get("mt_loss_prior")),
+        "winsorize_quantile_low": params.get("winsorize_quantile_low"),
+        "winsorize_quantile_high": params.get("winsorize_quantile_high"),
+        "graph_label_reweight": params.get("graph_label_reweight"),
+        "graph_label_bins": _json_or_none(params.get("graph_label_bins")),
+        "graph_label_weight_power": params.get("graph_label_weight_power"),
+        "graph_label_weight_clip": params.get("graph_label_weight_clip"),
+        "warm_up_epoch": params.get("warm_up_epoch"),
+        "init_base_lr": params.get("init_base_lr"),
+        "optim_type": params.get("optim_type"),
+        "start_lr": params.get("start_lr"),
+        "stage2_warmup_epochs": params.get("stage2_warmup_epochs"),
+        "stage3_warmup_epochs": params.get("stage3_warmup_epochs"),
+        "stage1_loss_weights": _json_or_none(params.get("stage1_loss_weights")),
+        "stage2_loss_weights": _json_or_none(params.get("stage2_loss_weights")),
+        "stage3_loss_weights": _json_or_none(params.get("stage3_loss_weights")),
+    }
 
 
 def build_candidate_row(candidate: Dict[str, Any]) -> Dict[str, Any]:
@@ -101,6 +140,8 @@ def build_candidate_row(candidate: Dict[str, Any]) -> Dict[str, Any]:
         "loss_weights": json.dumps(params.get("loss_weights"), ensure_ascii=False),
         "regression_label_transform": params.get("regression_label_transform"),
     }
+    row.update(_hidden_param_columns(params))
+    row["has_test_set"] = not bool(params.get("allow_empty_test", False))
     row.update(flatten_metric("stage1_valid", candidate.get("stage1_valid")))
     row.update(flatten_metric("stage1_test", candidate.get("stage1_test")))
     if candidate.get("stage3_model"):
@@ -147,6 +188,8 @@ def build_stage_score_rows(candidate: Dict[str, Any]) -> List[Dict[str, Any]]:
         "dist_bar": json.dumps(params.get("dist_bar"), ensure_ascii=False),
         "regression_label_transform": params.get("regression_label_transform"),
     }
+    base.update(_hidden_param_columns(params))
+    base["has_test_set"] = not bool(params.get("allow_empty_test", False))
     stage_specs = []
     if params.get("single_stage", False):
         stage_specs.append(("single", candidate.get("model"), candidate.get("valid"), candidate.get("test")))

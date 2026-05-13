@@ -1,0 +1,77 @@
+# Caco2 3-step finetune: cleaned data + cyclic scaffold split + no test set
+# 用途：資料量有限時，把 test set 併回 train/valid，只用 valid_RMSE 做模型選擇。
+# python 3_finetune_3step_mpp.py --search_config ./config/caco2_finetune_3step_cyclic_valonly.yaml
+
+task: caco2
+
+dataroot: ./data/mpp/pkl_clean_median
+splitroot: ./data/mpp/split_clean_median
+split_type: cyclic_scaffold
+split_pkl_path: ./data/mpp/split_clean_median/caco2_cyclic_scaffold_seed8_v0.10_t0.00.pkl
+allow_empty_test: true
+
+result_dir: ./outputs/caco2_pipeline_3step_cyclic_valonly
+gpus: "0"
+
+fixed:
+  seed: 8
+  batch_size: 32
+
+  dropout: 0.25
+  weight_decay: 1.0e-4
+  scheduler_type: cos
+
+  regression_label_transform: winsorized_standardize
+  winsorize_quantile_low: 0.01
+  winsorize_quantile_high: 0.99
+
+  optim_type: adam
+  warm_up_epoch: 10
+  start_lr: 1.0e-5
+  init_base_lr: 1.0e-4
+
+  loss_weights: null
+  stage2_loss_weights: null
+  stage3_loss_weights: null
+
+  mt_loss_eps: 1.0e-8
+  mt_loss_tau: 5.0
+  mt_ratio_clip: 2.0
+
+  encoder_lr_ratio: 0.03
+  max_grad_norm: 0.5
+
+  eval_before_train: true
+  graph_label_reweight: false
+
+three_stage:
+  stage1_lr: 5.0e-5
+  stage2_lr: 5.0e-5
+  stage3_lr: 1.0e-5
+
+  stage1_epochs: 20
+  stage2_epochs: 30
+  stage3_epochs: 120
+
+  stage1_patience: 10
+  stage2_patience: 10
+  stage3_patience: 30
+
+  stage2_warmup_epochs: 10
+  stage3_warmup_epochs: 10
+
+search:
+  dist_bar:
+    - [70, 90]
+    - [80, 90]
+    - [90, 100]
+    - [60, 90]
+    - [50, 100]
+
+  dropout: [0.25, 0.30]
+
+  mt_loss_prior:
+    - null
+    - graph: 1.0
+      finger: 0.3
+      atom_fg: 0.1

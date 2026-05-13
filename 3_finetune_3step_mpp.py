@@ -48,10 +48,14 @@ import torch
 import torch.nn.functional as F
 import yaml
 from torch import Tensor
+from torch.utils.data import DataLoader
 from tqdm.auto import tqdm
 
 import finetune_mpp as upstream
 from _config import *
+from data_process.data_collator import collator_finetune_pkl
+from data_process.split import create_splitter
+from datasets.dataloader import FinetuneDataset as FinetuneDataset_pkl
 from utils.caco2_pipeline_utils import (
     copy_model_to_result_dir,
     resolve_path,
@@ -64,7 +68,7 @@ from utils.global_var_util import *
 from utils.loss_util import get_balanced_atom_fg_loss
 from utils.metric_util import compute_cls_metric_tensor, compute_reg_metric_with_r2
 from utils.public_util import EarlyStopping, set_seed
-from utils.userconfig_util import config_current_user, config_dataset_form, get_dataset_form
+from utils.userconfig_util import config_current_user, config_dataset_form, drop_last_flag, get_dataset_form
 
 
 def parse_args():
@@ -74,7 +78,14 @@ def parse_args():
     parser.add_argument("--task", type=str, default="caco2")
     parser.add_argument("--dataroot", type=str, default="./data/mpp/pkl")
     parser.add_argument("--splitroot", type=str, default="./data/mpp/split")
-    parser.add_argument("--split_type", type=str, default="random_scaffold", choices=["scaffold", "random_scaffold"])
+    parser.add_argument(
+        "--split_type",
+        type=str,
+        default="random_scaffold",
+        choices=["scaffold", "random_scaffold", "cyclic_scaffold"],
+    )
+    parser.add_argument("--split_pkl_path", type=str, default=None)
+    parser.add_argument("--allow_empty_test", action="store_true")
     parser.add_argument("--result_dir", type=str, default="./outputs/caco2_pipeline")
     parser.add_argument("--gpus", type=str, default="0")
     parser.add_argument("--single_stage", action="store_true")
@@ -195,6 +206,54 @@ class CustomTrainer(upstream.Trainer):
         self.last_mt_weights = None
         self.best_metadata = {}
         self.graph_label_reweight_info = self._build_graph_label_reweight_info()
+
+    def get_data_loaders(self):
+        dataset = FinetuneDataset_pkl(root=self.config["root"], task_name=self.config["task_name"])
+        splitter = create_splitter(
+            self.config["split_type"],
+            self.config["seed"],
+            split_pkl_path=self.config.get("split_pkl_path"),
+            allow_empty_test=self.config.get("allow_empty_test", False),
+        )
+        train_dataset, val_dataset, test_dataset = splitter.split(dataset, self.config["task_name"])
+
+        num_workers = self.config["dataloader_num_workers"]
+        pin_memory = bool(self.config.get("pin_memory", False))
+        if num_workers == 0:
+            pin_memory = False
+        bsz = self.config["batch_size"]
+        train_loader = DataLoader(
+            train_dataset,
+            batch_size=bsz,
+            shuffle=True,
+            num_workers=num_workers,
+            collate_fn=collator_finetune_pkl,
+            pin_memory=pin_memory,
+            drop_last=drop_last_flag(len(train_dataset), bsz),
+        )
+        val_loader = DataLoader(
+            val_dataset,
+            batch_size=bsz,
+            shuffle=False,
+            num_workers=num_workers,
+            collate_fn=collator_finetune_pkl,
+            pin_memory=pin_memory,
+            drop_last=drop_last_flag(len(val_dataset), bsz),
+        )
+        if test_dataset is None:
+            test_loader = None
+        else:
+            test_loader = DataLoader(
+                test_dataset,
+                batch_size=bsz,
+                shuffle=False,
+                num_workers=num_workers,
+                pin_memory=pin_memory,
+                collate_fn=collator_finetune_pkl,
+                drop_last=drop_last_flag(len(test_dataset), bsz),
+            )
+        self.has_test_set = test_loader is not None and len(test_loader.dataset) > 0
+        return train_loader, val_loader, test_loader
 
     def calc_dynamic_mt_loss(self, loss_list, update_state=True):
         loss_list = torch.stack(loss_list)
@@ -438,6 +497,8 @@ class CustomTrainer(upstream.Trainer):
                 "best_valid_metric": float(valid_select_metric),
                 "best_valid_auc": self._metric_float(valid_metrics, "auc"),
                 "best_test_auc": self._metric_float(test_metrics, "auc"),
+                "has_test_set": bool(getattr(self, "has_test_set", True)),
+                "split_pkl_path": self.config.get("split_pkl_path"),
                 "stage_name": self.config.get("stage_name"),
                 "trial_serial": self.config.get("trial_serial"),
                 "dist_bar": self._current_dist_bar(),
@@ -463,6 +524,8 @@ class CustomTrainer(upstream.Trainer):
             "best_test_rmse": self._metric_float(test_metrics, "rmse"),
             "best_test_mae": self._metric_float(test_metrics, "mae"),
             "best_test_r2": self._metric_float(test_metrics, "r2"),
+            "has_test_set": bool(getattr(self, "has_test_set", True)),
+            "split_pkl_path": self.config.get("split_pkl_path"),
             "stage_name": self.config.get("stage_name"),
             "trial_serial": self.config.get("trial_serial"),
             "dist_bar": self._current_dist_bar(),
@@ -771,6 +834,14 @@ class CustomTrainer(upstream.Trainer):
             "raw_mean_loss",
         ]
 
+    def _empty_eval_result(self):
+        parts = {key: np.nan for key in self._loss_part_keys()}
+        if self.config["task"] == "classification":
+            metrics = {"auc": np.nan}
+            return np.nan, np.nan, parts, metrics
+        metrics = {"mae": np.nan, "rmse": np.nan, "r2": np.nan}
+        return np.nan, np.nan, parts, metrics
+
     def _epoch_metric_value(self, metric_dict: Dict):
         if self.config["task"] == "classification":
             return metric_dict.get("auc")
@@ -833,10 +904,13 @@ class CustomTrainer(upstream.Trainer):
                 self.val_loader,
                 "valid_epoch0_loaded_checkpoint",
             )
-            test_loss0, test_metric0, test_parts0, test_metrics0 = self._valid_step(
-                self.test_loader,
-                "test_epoch0_loaded_checkpoint",
-            )
+            if self.has_test_set:
+                test_loss0, test_metric0, test_parts0, test_metrics0 = self._valid_step(
+                    self.test_loader,
+                    "test_epoch0_loaded_checkpoint",
+                )
+            else:
+                test_loss0, test_metric0, test_parts0, test_metrics0 = self._empty_eval_result()
             write_record(
                 self.txtfile,
                 f"epoch:0_loaded_checkpoint\n"
@@ -852,7 +926,10 @@ class CustomTrainer(upstream.Trainer):
 
             train_loss, train_metric, train_parts, train_metrics = self._train_step()
             valid_loss, valid_metric, valid_parts, valid_metrics = self._valid_step(self.val_loader, "valid")
-            test_loss, test_metric, test_parts, test_metrics = self._valid_step(self.test_loader, "test")
+            if self.has_test_set:
+                test_loss, test_metric, test_parts, test_metrics = self._valid_step(self.test_loader, "test")
+            else:
+                test_loss, test_metric, test_parts, test_metrics = self._empty_eval_result()
             valid_select_metric = self._epoch_metric_value(valid_metrics)
 
             epoch_list.append(i)
@@ -898,10 +975,10 @@ class CustomTrainer(upstream.Trainer):
 
             if self.config["task"] == "classification":
                 early_stop_score = -valid_metrics["auc"]
-                early_stop_test_score = -test_metrics["auc"]
+                early_stop_test_score = -test_metrics["auc"] if self.has_test_set else np.nan
             else:
                 early_stop_score = valid_metrics["rmse"]
-                early_stop_test_score = test_metrics["rmse"]
+                early_stop_test_score = test_metrics["rmse"] if self.has_test_set else np.nan
 
             if stopper.step(early_stop_score, self.net, test_score=early_stop_test_score):
                 stopper.report_final_results(i_epoch=i)
@@ -942,12 +1019,13 @@ class CustomTrainer(upstream.Trainer):
         train_best_metric = train_metric_list[best_idx]
         valid_best_metric = val_metric_list[best_idx]
         test_best_metric = test_metric_list[best_idx]
+        test_metric_text = f"{test_best_metric:.6f}" if self.has_test_set else "N/A"
         tqdm.write(
             f"[Trial {trial_serial}] {stage_title} completed | "
             f"best_epoch={best_epoch} | "
             f"train_{metric_key}={train_best_metric:.6f} | "
             f"valid_{metric_key}={valid_best_metric:.6f} | "
-            f"test_{metric_key}={test_best_metric:.6f} | "
+            f"test_{metric_key}={test_metric_text} | "
             f"model={best_model_path}"
         )
         if os.path.exists(stopper_tmp_path):
@@ -967,11 +1045,14 @@ class CustomTrainer(upstream.Trainer):
         text_size = 6
         line_width = 1.0
         marker_line_width = 0.8
+        has_test_curve = not all(np.isnan(value) for value in test_metric_list)
+        has_test_loss_curve = not all(np.isnan(value) for value in test_loss_list)
 
         ax = axes[0, 0]
         ax.plot(epoch_list, train_loss_list, label="train_dynamic_mt_loss", linewidth=line_width)
         ax.plot(epoch_list, valid_loss_list, label="valid_dynamic_mt_loss", linewidth=line_width)
-        ax.plot(epoch_list, test_loss_list, label="test_dynamic_mt_loss", linewidth=line_width)
+        if has_test_loss_curve:
+            ax.plot(epoch_list, test_loss_list, label="test_dynamic_mt_loss", linewidth=line_width)
         ax.plot(
             epoch_list,
             loss_part_history["train"]["raw_mean_loss"],
@@ -986,13 +1067,14 @@ class CustomTrainer(upstream.Trainer):
             label="valid_raw_mean_loss",
             linewidth=line_width,
         )
-        ax.plot(
-            epoch_list,
-            loss_part_history["test"]["raw_mean_loss"],
-            linestyle="--",
-            label="test_raw_mean_loss",
-            linewidth=line_width,
-        )
+        if has_test_loss_curve:
+            ax.plot(
+                epoch_list,
+                loss_part_history["test"]["raw_mean_loss"],
+                linestyle="--",
+                label="test_raw_mean_loss",
+                linewidth=line_width,
+            )
         if best_epoch is not None:
             ax.axvline(best_epoch, linestyle="--", color="black", linewidth=marker_line_width, label=f"best_epoch={best_epoch}")
         ax.set_xlabel("Epoch", fontsize=font_size)
@@ -1003,6 +1085,8 @@ class CustomTrainer(upstream.Trainer):
 
         ax = axes[0, 1]
         for split_name, style in [("train", "-"), ("valid", "--"), ("test", ":")]:
+            if split_name == "test" and not has_test_loss_curve:
+                continue
             for part_name in ["graph_loss", "finger_loss", "atom_fg_loss", "raw_total_loss"]:
                 ax.plot(epoch_list, loss_part_history[split_name][part_name],
                         linestyle=style, label=f"{split_name}_{part_name}", linewidth=line_width)
@@ -1018,7 +1102,8 @@ class CustomTrainer(upstream.Trainer):
         primary_label = "RMSE" if self.config["task"] == "regression" else "AUC"
         ax.plot(epoch_list, train_metric_list, label=f"train_{primary_label}", linewidth=line_width)
         ax.plot(epoch_list, val_metric_list, label=f"valid_{primary_label}", linewidth=line_width)
-        ax.plot(epoch_list, test_metric_list, label=f"test_{primary_label}", linewidth=line_width)
+        if has_test_curve:
+            ax.plot(epoch_list, test_metric_list, label=f"test_{primary_label}", linewidth=line_width)
         if best_epoch is not None:
             ax.axvline(best_epoch, linestyle="--", color="black", linewidth=marker_line_width)
         ax.set_xlabel("Epoch", fontsize=font_size)
@@ -1034,7 +1119,8 @@ class CustomTrainer(upstream.Trainer):
         if self.config["task"] == "regression":
             ax.plot(epoch_list, train_r2_list, label="train_R2", linewidth=line_width)
             ax.plot(epoch_list, val_r2_list, label="valid_R2", linewidth=line_width)
-            ax.plot(epoch_list, test_r2_list, label="test_R2", linewidth=line_width)
+            if has_test_curve:
+                ax.plot(epoch_list, test_r2_list, label="test_R2", linewidth=line_width)
             ax.set_ylabel("R2", fontsize=font_size)
             ax.set_title("R2 Curve: reference only", fontsize=title_size)
         else:
@@ -1118,6 +1204,32 @@ def dist_bar_grid(search_value, default_value):
     raise ValueError("dist_bar search values must be like [30, 60] or [[20, 60], [30, 60]].")
 
 
+def _normalize_for_signature(value):
+    if isinstance(value, dict):
+        return {key: _normalize_for_signature(item) for key, item in sorted(value.items())}
+    if isinstance(value, (list, tuple)):
+        return [_normalize_for_signature(item) for item in value]
+    return value
+
+
+def _effective_trial_signature(trial):
+    sig = dict(trial)
+    if sig.get("regression_label_transform") != "winsorized_standardize":
+        sig.pop("winsorize_quantile_low", None)
+        sig.pop("winsorize_quantile_high", None)
+    if not sig.get("graph_label_reweight", False):
+        sig.pop("graph_label_bins", None)
+        sig.pop("graph_label_weight_power", None)
+        sig.pop("graph_label_weight_clip", None)
+    sig.pop("run_tag_base", None)
+    return json.dumps(
+        _normalize_for_signature(sig),
+        sort_keys=True,
+        ensure_ascii=False,
+        default=str,
+    )
+
+
 def build_config(base_args, trial, trainable_scope, checkpoint):
     config_path = Path(pdir) / "config" / "config_finetune.yaml"
     with open(config_path, "r", encoding="utf-8") as f:
@@ -1128,9 +1240,18 @@ def build_config(base_args, trial, trainable_scope, checkpoint):
     user = "mpp"
     config["userconfig"][user]["dataset_dir"] = base_args.dataroot
     config["userconfig"][user]["split_dir"] = base_args.splitroot
+    split_pkl_path = trial.get("split_pkl_path", getattr(base_args, "split_pkl_path", None))
+    if split_pkl_path:
+        split_pkl_path = resolve_path(Path(__file__).resolve().parent, split_pkl_path)
+        if not split_pkl_path.exists():
+            raise FileNotFoundError(f"split_pkl_path not found: {split_pkl_path}")
+        split_pkl_path = str(split_pkl_path)
+        config["userconfig"][user]["split_file"] = split_pkl_path
     config = config_current_user(user, config)
     config = config_dataset_form("pkl", config)
     config["split_type"] = base_args.split_type
+    config["split_pkl_path"] = split_pkl_path
+    config["allow_empty_test"] = bool(trial.get("allow_empty_test", getattr(base_args, "allow_empty_test", False)))
     config["task_name"] = base_args.task
     config["epochs"] = trial["epochs"]
     config["batch_size"] = trial["batch_size"]
@@ -1278,6 +1399,8 @@ def build_trials(cfg, default_dist_bar):
         ),
         "stage2_loss_weights": fixed.get("stage2_loss_weights", None),
         "stage3_loss_weights": fixed.get("stage3_loss_weights", fixed.get("loss_weights")),
+        "split_pkl_path": fixed.get("split_pkl_path", cfg.get("split_pkl_path")),
+        "allow_empty_test": fixed.get("allow_empty_test", cfg.get("allow_empty_test", False)),
         "dist_bar": fixed.get("dist_bar", default_dist_bar),
     }
     grids = {key: as_list(search.get(key), base[key]) for key in base if key != "dist_bar"}
@@ -1295,7 +1418,21 @@ def build_trials(cfg, default_dist_bar):
         ).replace(".", "p")
         item["run_tag_base"] = tag
         trials.append(item)
-    return trials
+
+    deduped = []
+    seen = set()
+    for trial in trials:
+        sig = _effective_trial_signature(trial)
+        if sig in seen:
+            continue
+        seen.add(sig)
+        deduped.append(trial)
+    print(
+        f"[Search] raw trials={len(trials)} "
+        f"deduped trials={len(deduped)} "
+        f"removed={len(trials) - len(deduped)}"
+    )
+    return deduped
 
 
 def eval_settings(args, trial):
@@ -1311,6 +1448,8 @@ def eval_settings(args, trial):
         "result_dir": args.result_dir,
         "pkl_dir": args.dataroot,
         "split_root": str(split_root),
+        "split_pkl_path": trial.get("split_pkl_path", getattr(args, "split_pkl_path", None)),
+        "allow_empty_test": bool(trial.get("allow_empty_test", getattr(args, "allow_empty_test", False))),
     }
 
 
@@ -1431,13 +1570,37 @@ def predict_primary_metric_name(metric):
     return "rmse"
 
 
+def metric_value_text(metric, metric_name):
+    if not metric or metric_name is None:
+        return "N/A"
+    value = metric.get(metric_name)
+    if value is None:
+        return "N/A"
+    try:
+        if np.isnan(value):
+            return "N/A"
+    except TypeError:
+        pass
+    return f"{value:.6f}"
+
+
 def main():
     args = parse_args()
     project_root = Path(__file__).resolve().parent
     py = sys.executable
     file_cfg = read_search_config(args.search_config)
     cfg_tag = config_name_tag(args.search_config)
-    for key in ["task", "dataroot", "splitroot", "split_type", "result_dir", "gpus", "dist_bar"]:
+    for key in [
+        "task",
+        "dataroot",
+        "splitroot",
+        "split_type",
+        "split_pkl_path",
+        "allow_empty_test",
+        "result_dir",
+        "gpus",
+        "dist_bar",
+    ]:
         if key in file_cfg:
             setattr(args, key, file_cfg[key])
 
@@ -1478,7 +1641,7 @@ def main():
                 tqdm.write(
                     f"[Trial {idx}/{len(trials)}] resume_disk | re-eval | "
                     f"valid_{final_metric_name}={valid_metric.get(final_metric_name):.6f} | "
-                    f"test_{final_metric_name}={test_metric.get(final_metric_name):.6f} | "
+                    f"test_{final_metric_name}={metric_value_text(test_metric, final_metric_name)} | "
                     f"model={resumed_candidate['model']}"
                 )
                 task_type = valid_metric["task_type"]
@@ -1548,6 +1711,8 @@ def main():
                 "graph_label_weight_power": trial_cfg.get("graph_label_weight_power", 0.5),
                 "graph_label_weight_clip": trial_cfg.get("graph_label_weight_clip", 3.0),
                 "dist_bar": trial_cfg["dist_bar"],
+                "split_pkl_path": trial_cfg.get("split_pkl_path"),
+                "allow_empty_test": trial_cfg.get("allow_empty_test", False),
             }
             save_trial_params(trial_dir, args, trial_cfg, {"single": stage2_trial})
             candidate_model = run_training(args, stage2_trial, "all", args.pretrain_ckpt)
@@ -1592,6 +1757,8 @@ def main():
                 "graph_label_weight_power": trial_cfg.get("graph_label_weight_power", 0.5),
                 "graph_label_weight_clip": trial_cfg.get("graph_label_weight_clip", 3.0),
                 "dist_bar": trial_cfg["dist_bar"],
+                "split_pkl_path": trial_cfg.get("split_pkl_path"),
+                "allow_empty_test": trial_cfg.get("allow_empty_test", False),
             }
             save_trial_params(trial_dir, args, trial_cfg, {"stage1": stage1_trial})
             stage1_model = run_training(args, stage1_trial, "head", args.pretrain_ckpt)
@@ -1605,7 +1772,7 @@ def main():
             tqdm.write(
                 f"[Trial {idx}/{len(trials)}] stage1 best checkpoint re-eval | "
                 f"valid_{stage1_metric_name}={stage1_valid_metric.get(stage1_metric_name):.6f} | "
-                f"test_{stage1_metric_name}={stage1_test_metric.get(stage1_metric_name):.6f} | "
+                f"test_{stage1_metric_name}={metric_value_text(stage1_test_metric, stage1_metric_name)} | "
                 f"model={stage1_model}"
             )
 
@@ -1646,6 +1813,8 @@ def main():
                 "graph_label_weight_power": trial_cfg.get("graph_label_weight_power", 0.5),
                 "graph_label_weight_clip": trial_cfg.get("graph_label_weight_clip", 3.0),
                 "dist_bar": trial_cfg["dist_bar"],
+                "split_pkl_path": trial_cfg.get("split_pkl_path"),
+                "allow_empty_test": trial_cfg.get("allow_empty_test", False),
             }
             save_trial_params(trial_dir, args, trial_cfg, {"stage1": stage1_trial, "stage2": stage2_trial})
             stage2_model = run_training(args, stage2_trial, "heads", stage1_model)
@@ -1659,7 +1828,7 @@ def main():
             tqdm.write(
                 f"[Trial {idx}/{len(trials)}] stage2 best checkpoint re-eval | "
                 f"valid_{stage2_metric_name}={stage2_valid_metric.get(stage2_metric_name):.6f} | "
-                f"test_{stage2_metric_name}={stage2_test_metric.get(stage2_metric_name):.6f} | "
+                f"test_{stage2_metric_name}={metric_value_text(stage2_test_metric, stage2_metric_name)} | "
                 f"model={stage2_model}"
             )
 
@@ -1701,6 +1870,8 @@ def main():
                 "graph_label_weight_power": trial_cfg.get("graph_label_weight_power", 0.5),
                 "graph_label_weight_clip": trial_cfg.get("graph_label_weight_clip", 3.0),
                 "dist_bar": trial_cfg["dist_bar"],
+                "split_pkl_path": trial_cfg.get("split_pkl_path"),
+                "allow_empty_test": trial_cfg.get("allow_empty_test", False),
             }
             save_trial_params(
                 trial_dir,
@@ -1716,7 +1887,7 @@ def main():
         tqdm.write(
             f"[Trial {idx}/{len(trials)}] {final_tag} best checkpoint re-eval | "
             f"valid_{final_metric_name}={valid_metric.get(final_metric_name):.6f} | "
-            f"test_{final_metric_name}={test_metric.get(final_metric_name):.6f} | "
+            f"test_{final_metric_name}={metric_value_text(test_metric, final_metric_name)} | "
             f"model={candidate_model}"
         )
         task_type = valid_metric["task_type"]
