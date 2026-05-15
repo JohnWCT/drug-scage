@@ -6,6 +6,7 @@ Three-step MPP finetuning runner for SCAGE.
   2. Stage 2: 載入 Stage 1 best model，freeze encoder，訓練 head_Graph、finger head、atom FG head。
   3. Stage 3: 載入 Stage 2 best model，解凍全模型 finetune。
   4. 依 valid split 的 primary metric 選出最佳參數組合，複製到 result_dir/<task>_best.pth。
+  每次執行會在 finetune_result/<run_session>/ 下集中本輪所有 trial（子資料夾為各 trial）。
 
 執行範例:
   python 3_finetune_3step_mpp.py --search_config ./config/caco2_finetune_search.yaml
@@ -29,9 +30,12 @@ Three-step MPP finetuning runner for SCAGE.
 參數搜尋:
   --search_config 支援 JSON 或 YAML。檔案內的 search 區塊可以放 list，
   程式會用 Cartesian product 暴力搜尋所有組合。
+  模型與訓練最佳化超參數（optimizer、scheduler、warm_up_epoch、dist_bar、embedding_dim 等）
+  請寫在 YAML 的 fixed / three_stage / search；CLI 僅保留路徑與執行相關選項。
 """
 
 import argparse
+import datetime
 import gc
 import itertools
 import json
@@ -93,21 +97,18 @@ def parse_args():
     parser.add_argument("--save_ckpt", type=int, default=1)
     parser.add_argument("--dataloader_num_workers", type=int, default=0)
     parser.add_argument("--pin_memory", type=int, default=0)
-    parser.add_argument("--optim_type", type=str, default="adam", choices=["adam", "rms", "sgd"])
-    parser.add_argument("--scheduler_type", type=str, default="None", choices=["None", "linear", "square", "cos"])
-    parser.add_argument("--warm_up_epoch", type=int, default=5)
-    parser.add_argument("--dist_bar", nargs="+", type=int, default=[30, 60],
-                        help="Default multiscale distance percentile thresholds")
-    parser.add_argument("--embedding_dim", type=int, default=512)
-    parser.add_argument("--hidden_dim", type=int, default=256)
-    parser.add_argument("--layer_num", type=int, default=6)
-    parser.add_argument("--num_heads", type=int, default=16)
     parser.add_argument("--minimal_outputs", type=int, default=1, choices=[0, 1],
                         help="1: keep model.pth + config_finetune.yaml + learning_curve.png + record.txt")
     parser.add_argument(
         "--resume_disk",
         action="store_true",
         help="If trial_dir already has trained model.pth, skip training and only re-run predict eval (for crash recovery).",
+    )
+    parser.add_argument(
+        "--finetune_run_label",
+        type=str,
+        default=None,
+        help="Optional suffix for finetune_result/<run_folder>/; default uses timestamp so each run is isolated.",
     )
     return parser.parse_args()
 
@@ -121,6 +122,8 @@ def custom_log_dir(config: Dict) -> str:
     )
     if config.get("run_tag"):
         run_name = f"{run_name}_{config['run_tag']}"
+    if config.get("finetune_run_root"):
+        return os.path.join(str(config["finetune_run_root"]), run_name)
     return os.path.join("finetune_result", run_name)
 
 
@@ -138,6 +141,14 @@ def as_list(value, default):
     if value is None:
         value = default
     return value if isinstance(value, list) else [value]
+
+
+def drop_constant_score_table_columns(df: pd.DataFrame) -> pd.DataFrame:
+    """Remove columns where every row has the same value (including all-NaN / all-empty)."""
+    if df.empty or len(df.columns) == 0:
+        return df
+    keep = [c for c in df.columns if df[c].nunique(dropna=False) > 1]
+    return df.loc[:, keep] if keep else df.iloc[:, :0]
 
 
 def to_serializable(value):
@@ -170,7 +181,18 @@ def trial_folder_name(task: str, split_type: str, config_tag: str, idx: int) -> 
     return f"{task}_{split_type}_{config_tag}_{idx:03d}"
 
 
-def save_trial_params(trial_dir: Path, args, trial_cfg, stage_trials=None):
+def finetune_run_folder_name(task: str, cfg_tag: str, label: str = None) -> str:
+    """One directory per process invocation under finetune_result/."""
+    safe_tag = "".join(ch if ch.isalnum() or ch in {"-", "_"} else "_" for ch in (cfg_tag or "run"))[:80]
+    if label:
+        safe_lbl = "".join(ch if ch.isalnum() or ch in {"-", "_"} else "_" for ch in label.strip())[:80]
+        if safe_lbl:
+            return f"{task}_{safe_tag}_{safe_lbl}"
+    ts = datetime.datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+    return f"{task}_{safe_tag}_{ts}"
+
+
+def save_trial_params(trial_dir: Path, args, trial_cfg, stage_trials=None, finetune_run_dir: Path = None):
     payload = {
         "task": args.task,
         "split_type": args.split_type,
@@ -179,6 +201,8 @@ def save_trial_params(trial_dir: Path, args, trial_cfg, stage_trials=None):
         "trial_dir": str(trial_dir),
         "search_trial": trial_cfg,
     }
+    if finetune_run_dir is not None:
+        payload["finetune_run_dir"] = str(finetune_run_dir.resolve())
     if stage_trials:
         payload["stages"] = stage_trials
     write_yaml(trial_dir / "trial_params.yaml", payload)
@@ -871,6 +895,10 @@ class CustomTrainer(upstream.Trainer):
         mode = "lower"
         stopper_tmp_path = os.path.join(self.writer.log_dir, "_early_stop_tmp.pth")
         stopper = EarlyStopping(mode=mode, patience=GlobalVar.patience, filename=stopper_tmp_path)
+        warm_sel = int(self.config.get("early_stop_selection_warmup_epochs", 0) or 0)
+        epochs_cap = int(self.config.get("epochs", 0) or 0)
+        if epochs_cap > 0:
+            warm_sel = min(warm_sel, max(0, epochs_cap - 1))
 
         epoch_list = []
         train_loss_list, valid_loss_list, test_loss_list = [], [], []
@@ -892,6 +920,12 @@ class CustomTrainer(upstream.Trainer):
             f"epochs={self.config['epochs']} | batch_size={self.config['batch_size']} | "
             f"lr={self.config['optim']['init_lr']} | target_transform={self.config.get('regression_label_transform', 'none')}"
         )
+        if warm_sel > 0:
+            tqdm.write(
+                f"[Trial {trial_serial}] {stage_title} | "
+                f"early_stop_selection_warmup_epochs={warm_sel} "
+                f"(best checkpoint + early-stopping counter start after epoch {warm_sel})"
+            )
 
         epoch_progress = tqdm(
             range(self.start_epoch, self.config["epochs"] + 1),
@@ -954,35 +988,36 @@ class CustomTrainer(upstream.Trainer):
                 else:
                     mt_weight_history[key].append(mt_weights.get(key, np.nan))
 
-            if self._is_better(valid_select_metric, self.best_metric):
-                self.best_metric = valid_select_metric
-                best_epoch = i
-                self._update_best_metadata(
-                    i,
-                    valid_select_metric,
-                    train_metrics,
-                    valid_metrics,
-                    test_metrics,
-                )
-                self._save_best_model()
-                write_record(
-                    self.txtfile,
-                    f"best_model_updated epoch:{best_epoch} "
-                    f"selection_metric:{self.best_metadata.get('selection_metric')} "
-                    f"valid_{self._epoch_metric_key()}:{valid_select_metric} "
-                    f"path:{best_model_path}",
-                )
+            if warm_sel <= 0 or i > warm_sel:
+                if self._is_better(valid_select_metric, self.best_metric):
+                    self.best_metric = valid_select_metric
+                    best_epoch = i
+                    self._update_best_metadata(
+                        i,
+                        valid_select_metric,
+                        train_metrics,
+                        valid_metrics,
+                        test_metrics,
+                    )
+                    self._save_best_model()
+                    write_record(
+                        self.txtfile,
+                        f"best_model_updated epoch:{best_epoch} "
+                        f"selection_metric:{self.best_metadata.get('selection_metric')} "
+                        f"valid_{self._epoch_metric_key()}:{valid_select_metric} "
+                        f"path:{best_model_path}",
+                    )
 
-            if self.config["task"] == "classification":
-                early_stop_score = -valid_metrics["auc"]
-                early_stop_test_score = -test_metrics["auc"] if self.has_test_set else np.nan
-            else:
-                early_stop_score = valid_metrics["rmse"]
-                early_stop_test_score = test_metrics["rmse"] if self.has_test_set else np.nan
+                if self.config["task"] == "classification":
+                    early_stop_score = -valid_metrics["auc"]
+                    early_stop_test_score = -test_metrics["auc"] if self.has_test_set else np.nan
+                else:
+                    early_stop_score = valid_metrics["rmse"]
+                    early_stop_test_score = test_metrics["rmse"] if self.has_test_set else np.nan
 
-            if stopper.step(early_stop_score, self.net, test_score=early_stop_test_score):
-                stopper.report_final_results(i_epoch=i)
-                break
+                if stopper.step(early_stop_score, self.net, test_score=early_stop_test_score):
+                    stopper.report_final_results(i_epoch=i)
+                    break
 
             self.writer.add_scalar("valid_loss", valid_loss, global_step=i)
             self.writer.add_scalar("test_loss", test_loss, global_step=i)
@@ -1002,11 +1037,20 @@ class CustomTrainer(upstream.Trainer):
                 )
             )
         if best_epoch is None and val_metric_list:
-            if self.config["task"] == "classification":
-                best_idx = int(np.argmax(val_metric_list))
+            eligible = [j for j in range(len(epoch_list)) if epoch_list[j] > warm_sel]
+            if eligible:
+                pool = [val_metric_list[j] for j in eligible]
+                if self.config["task"] == "classification":
+                    rel = int(np.argmax(pool))
+                else:
+                    rel = int(np.argmin(pool))
+                best_epoch = epoch_list[eligible[rel]]
             else:
-                best_idx = int(np.argmin(val_metric_list))
-            best_epoch = epoch_list[best_idx]
+                if self.config["task"] == "classification":
+                    best_idx = int(np.argmax(val_metric_list))
+                else:
+                    best_idx = int(np.argmin(val_metric_list))
+                best_epoch = epoch_list[best_idx]
         self._save_learning_curve(
             epoch_list, train_loss_list, valid_loss_list, test_loss_list,
             train_metric_list, val_metric_list, test_metric_list,
@@ -1264,15 +1308,16 @@ def build_config(base_args, trial, trainable_scope, checkpoint):
     config["optim"]["init_lr"] = trial["lr"]
     config["optim"]["init_base_lr"] = trial.get("init_base_lr", config["optim"].get("init_base_lr", 1e-4))
     config["optim"]["weight_decay"] = trial["weight_decay"]
-    config["optim"]["type"] = trial.get("optim_type", base_args.optim_type)
+    config["optim"]["type"] = trial.get("optim_type", "adam")
     config["optim"]["momentum"] = 0
-    config["lr_scheduler"]["type"] = trial.get("scheduler_type", base_args.scheduler_type)
-    config["lr_scheduler"]["warm_up_epoch"] = trial.get("warm_up_epoch", base_args.warm_up_epoch)
+    config["lr_scheduler"]["type"] = trial.get("scheduler_type", "None")
+    config["lr_scheduler"]["warm_up_epoch"] = int(trial.get("warm_up_epoch", 5))
     config["lr_scheduler"]["start_lr"] = trial.get("start_lr", config["lr_scheduler"].get("start_lr", 1e-5))
     config["checkpoint"] = checkpoint
     config["run_tag"] = trial["run_tag"]
     config["log_dir"] = trial.get("log_dir")
     config["trial_dir"] = trial.get("trial_dir")
+    config["finetune_run_root"] = trial.get("finetune_run_root")
     config["trial_serial"] = trial.get("trial_serial")
     config["stage_name"] = trial.get("stage_name")
     config["trainable_scope"] = trainable_scope
@@ -1298,19 +1343,22 @@ def build_config(base_args, trial, trainable_scope, checkpoint):
     set_seed(config["seed"])
     GlobalVar.patience = trial["patience"]
     config["patience"] = GlobalVar.patience
+    config["early_stop_selection_warmup_epochs"] = int(
+        trial.get("early_stop_selection_warmup_epochs", 0) or 0
+    )
     RoutineControl.save_best_ckpt = True
-    apply_dist_bar(trial.get("dist_bar", base_args.dist_bar))
+    apply_dist_bar(trial.get("dist_bar", [30, 60]))
     GlobalVar.embedding_style = "more"
-    GlobalVar.transformer_dim = base_args.embedding_dim
-    GlobalVar.ffn_dim = base_args.hidden_dim
-    GlobalVar.num_heads = base_args.num_heads
+    GlobalVar.transformer_dim = int(trial.get("embedding_dim", 512))
+    GlobalVar.ffn_dim = int(trial.get("hidden_dim", 256))
+    GlobalVar.num_heads = int(trial.get("num_heads", 16))
     GlobalVar.freeze_layers = 0
     GlobalVar.parallel_train = False
     config["model"]["atom_embed_dim"] = GlobalVar.transformer_dim
     config["model"]["bond_embed_dim"] = GlobalVar.transformer_dim
     config["model"]["hidden_size"] = GlobalVar.ffn_dim
     config["model"]["num_heads"] = GlobalVar.num_heads
-    config["model"]["layer_num"] = base_args.layer_num
+    config["model"]["layer_num"] = int(trial.get("layer_num", 6))
     config["fg_num_"] = nfg() + 1
     config["freeze_layers"] = GlobalVar.freeze_layers
     config["loss_style"] = GlobalVar.loss_style
@@ -1352,10 +1400,12 @@ def run_training(base_args, trial, trainable_scope, checkpoint):
     return model_path
 
 
-def build_trials(cfg, default_dist_bar):
+def build_trials(cfg):
     fixed = cfg.get("fixed", {}) or {}
     search = cfg.get("search", cfg.get("grid", {})) or {}
     three_stage = cfg.get("three_stage", cfg.get("two_stage", {})) or {}
+    shared_warmup = fixed.get("warm_up_epoch", 5)
+    default_dist_bar = fixed.get("dist_bar", [30, 60])
     base = {
         "seed": fixed.get("seed", 8),
         "batch_size": fixed.get("batch_size", 16),
@@ -1363,7 +1413,11 @@ def build_trials(cfg, default_dist_bar):
         "weight_decay": fixed.get("weight_decay", 1e-4),
         "init_base_lr": fixed.get("init_base_lr", 1e-4),
         "optim_type": fixed.get("optim_type", "adam"),
-        "warm_up_epoch": fixed.get("warm_up_epoch", 5),
+        "embedding_dim": int(fixed.get("embedding_dim", 512)),
+        "hidden_dim": int(fixed.get("hidden_dim", 256)),
+        "layer_num": int(fixed.get("layer_num", 6)),
+        "num_heads": int(fixed.get("num_heads", 16)),
+        "warm_up_epoch": shared_warmup,
         "start_lr": fixed.get("start_lr", 1e-5),
         "stage1_lr": three_stage.get("stage1_lr", fixed.get("lr", 5e-5)),
         "stage2_lr": three_stage.get("stage2_lr", fixed.get("lr", 5e-5)),
@@ -1391,8 +1445,18 @@ def build_trials(cfg, default_dist_bar):
         ),
         "graph_label_weight_power": fixed.get("graph_label_weight_power", 0.5),
         "graph_label_weight_clip": fixed.get("graph_label_weight_clip", 3.0),
-        "stage2_warmup_epochs": three_stage.get("stage2_warmup_epochs", fixed.get("warm_up_epoch", 5)),
-        "stage3_warmup_epochs": three_stage.get("stage3_warmup_epochs", fixed.get("warm_up_epoch", 5)),
+        "stage1_warmup_epochs": three_stage.get("stage1_warmup_epochs", shared_warmup),
+        "stage2_warmup_epochs": three_stage.get("stage2_warmup_epochs", shared_warmup),
+        "stage3_warmup_epochs": three_stage.get("stage3_warmup_epochs", shared_warmup),
+        "stage1_early_stop_warmup_epochs": three_stage.get(
+            "stage1_early_stop_warmup_epochs", fixed.get("stage1_early_stop_warmup_epochs")
+        ),
+        "stage2_early_stop_warmup_epochs": three_stage.get(
+            "stage2_early_stop_warmup_epochs", fixed.get("stage2_early_stop_warmup_epochs")
+        ),
+        "stage3_early_stop_warmup_epochs": three_stage.get(
+            "stage3_early_stop_warmup_epochs", fixed.get("stage3_early_stop_warmup_epochs")
+        ),
         "stage1_loss_weights": fixed.get(
             "stage1_loss_weights",
             {"graph": 1.0, "finger": 0.0, "atom_fg": 0.0},
@@ -1401,9 +1465,18 @@ def build_trials(cfg, default_dist_bar):
         "stage3_loss_weights": fixed.get("stage3_loss_weights", fixed.get("loss_weights")),
         "split_pkl_path": fixed.get("split_pkl_path", cfg.get("split_pkl_path")),
         "allow_empty_test": fixed.get("allow_empty_test", cfg.get("allow_empty_test", False)),
-        "dist_bar": fixed.get("dist_bar", default_dist_bar),
+        "dist_bar": default_dist_bar,
     }
-    grids = {key: as_list(search.get(key), base[key]) for key in base if key != "dist_bar"}
+    grids = {}
+    for key in base:
+        if key == "dist_bar":
+            continue
+        # Default `graph_label_bins` is a list of floats; `as_list` would treat each float as a
+        # separate grid point. Only expand when `search` explicitly provides alternatives.
+        if key == "graph_label_bins" and search.get("graph_label_bins") is None:
+            grids[key] = [base["graph_label_bins"]]
+        else:
+            grids[key] = as_list(search.get(key), base[key])
     grids["dist_bar"] = dist_bar_grid(search.get("dist_bar"), base["dist_bar"])
     trials = []
     for idx, values in enumerate(itertools.product(*(grids[key] for key in base)), start=1):
@@ -1465,6 +1538,7 @@ def try_resume_trial_from_disk(
 ):
     """Rebuild one trial candidate from checkpoints if training already finished on disk."""
     trial_dir = Path(trial_dir)
+    fr_dir = trial_cfg.get("finetune_run_root")
     eval_args = settings_namespace(eval_settings(args, trial_cfg))
 
     if args.single_stage:
@@ -1484,7 +1558,8 @@ def try_resume_trial_from_disk(
         )
         return {
             "idx": idx,
-            "trial_dir": str(trial_dir),
+            "trial_dir": str(trial_dir.resolve()),
+            "finetune_run_dir": fr_dir,
             "run_tag": final_tag,
             "model": str(candidate_model),
             "stage1_run_tag": stage1_tag,
@@ -1500,6 +1575,7 @@ def try_resume_trial_from_disk(
             "stage2_test": stage2_test_metric,
             "valid": valid_metric,
             "test": test_metric,
+            "completion": "full",
         }
 
     stage1_model = trial_dir / "stage1" / "model.pth"
@@ -1535,7 +1611,8 @@ def try_resume_trial_from_disk(
 
     return {
         "idx": idx,
-        "trial_dir": str(trial_dir),
+        "trial_dir": str(trial_dir.resolve()),
+        "finetune_run_dir": fr_dir,
         "run_tag": final_tag,
         "model": str(candidate_model),
         "stage1_run_tag": stage1_tag,
@@ -1551,6 +1628,7 @@ def try_resume_trial_from_disk(
         "stage2_test": stage2_test_metric,
         "valid": valid_metric,
         "test": test_metric,
+        "completion": "full",
     }
 
 
@@ -1599,7 +1677,6 @@ def main():
         "allow_empty_test",
         "result_dir",
         "gpus",
-        "dist_bar",
     ]:
         if key in file_cfg:
             setattr(args, key, file_cfg[key])
@@ -1615,15 +1692,35 @@ def main():
     best_metric = None
     best_candidate = None
 
-    trials = build_trials(file_cfg, args.dist_bar)
+    trials = build_trials(file_cfg)
+    finetune_result_root = project_root / "finetune_result"
+    finetune_result_root.mkdir(parents=True, exist_ok=True)
+    run_folder = finetune_run_folder_name(args.task, cfg_tag, args.finetune_run_label)
+    finetune_run_root = finetune_result_root / run_folder
+    finetune_run_root.mkdir(parents=True, exist_ok=True)
+    fr_root = str(finetune_run_root.resolve())
+    run_manifest = {
+        "created_at": datetime.datetime.now().isoformat(timespec="seconds"),
+        "search_config": args.search_config,
+        "result_dir": str(result_dir.resolve()),
+        "task": args.task,
+        "split_type": args.split_type,
+        "n_trials": len(trials),
+        "run_folder": run_folder,
+        "finetune_run_dir": fr_root,
+    }
+    write_yaml(finetune_run_root / "run_manifest.yaml", run_manifest)
+    tqdm.write(f"[Run] finetune_result session directory: {finetune_run_root}")
+
     trial_progress = tqdm(trials, desc=f"{args.task} hyperparameter trials", unit="trial", dynamic_ncols=True)
     for idx, trial_cfg in enumerate(trial_progress, start=1):
         trial_name = trial_folder_name(args.task, args.split_type, cfg_tag, idx)
-        trial_dir = project_root / "finetune_result" / trial_name
+        trial_dir = finetune_run_root / trial_name
         trial_dir.mkdir(parents=True, exist_ok=True)
         trial_cfg["trial_serial"] = idx
         trial_cfg["trial_name"] = trial_name
-        trial_cfg["trial_dir"] = str(trial_dir)
+        trial_cfg["trial_dir"] = str(trial_dir.resolve())
+        trial_cfg["finetune_run_root"] = fr_root
         trial_progress.set_postfix(
             trial=trial_name,
             transform=trial_cfg.get("regression_label_transform", "none"),
@@ -1682,7 +1779,7 @@ def main():
                 "weight_decay": trial_cfg["weight_decay"],
                 "init_base_lr": trial_cfg["init_base_lr"],
                 "optim_type": trial_cfg["optim_type"],
-                "warm_up_epoch": trial_cfg.get("stage3_warmup_epochs", trial_cfg["warm_up_epoch"]),
+                "warm_up_epoch": trial_cfg["stage3_warmup_epochs"],
                 "start_lr": trial_cfg["start_lr"],
                 "lr": trial_cfg["stage3_lr"],
                 "epochs": trial_cfg["stage3_epochs"],
@@ -1691,6 +1788,7 @@ def main():
                 "run_tag": final_tag,
                 "log_dir": str(trial_dir / "single"),
                 "trial_dir": str(trial_dir),
+                "finetune_run_root": fr_root,
                 "trial_serial": idx,
                 "stage_name": "single",
                 "loss_weights": trial_cfg.get("stage3_loss_weights"),
@@ -1713,8 +1811,13 @@ def main():
                 "dist_bar": trial_cfg["dist_bar"],
                 "split_pkl_path": trial_cfg.get("split_pkl_path"),
                 "allow_empty_test": trial_cfg.get("allow_empty_test", False),
+                "early_stop_selection_warmup_epochs": int(
+                    trial_cfg["stage3_early_stop_warmup_epochs"]
+                    if trial_cfg.get("stage3_early_stop_warmup_epochs") is not None
+                    else trial_cfg["stage3_warmup_epochs"]
+                ),
             }
-            save_trial_params(trial_dir, args, trial_cfg, {"single": stage2_trial})
+            save_trial_params(trial_dir, args, trial_cfg, {"single": stage2_trial}, finetune_run_dir=finetune_run_root)
             candidate_model = run_training(args, stage2_trial, "all", args.pretrain_ckpt)
         else:
             stage1_tag = "stage1"
@@ -1725,7 +1828,7 @@ def main():
                 "weight_decay": trial_cfg["weight_decay"],
                 "init_base_lr": trial_cfg["init_base_lr"],
                 "optim_type": trial_cfg["optim_type"],
-                "warm_up_epoch": trial_cfg["warm_up_epoch"],
+                "warm_up_epoch": trial_cfg["stage1_warmup_epochs"],
                 "start_lr": trial_cfg["start_lr"],
                 "lr": trial_cfg["stage1_lr"],
                 "epochs": trial_cfg["stage1_epochs"],
@@ -1734,8 +1837,14 @@ def main():
                 "run_tag": stage1_tag,
                 "log_dir": str(trial_dir / "stage1"),
                 "trial_dir": str(trial_dir),
+                "finetune_run_root": fr_root,
                 "trial_serial": idx,
                 "stage_name": "stage1",
+                "early_stop_selection_warmup_epochs": int(
+                    trial_cfg["stage1_early_stop_warmup_epochs"]
+                    if trial_cfg.get("stage1_early_stop_warmup_epochs") is not None
+                    else trial_cfg["stage1_warmup_epochs"]
+                ),
                 "loss_weights": trial_cfg.get(
                     "stage1_loss_weights",
                     {"graph": 1.0, "finger": 0.0, "atom_fg": 0.0},
@@ -1760,7 +1869,7 @@ def main():
                 "split_pkl_path": trial_cfg.get("split_pkl_path"),
                 "allow_empty_test": trial_cfg.get("allow_empty_test", False),
             }
-            save_trial_params(trial_dir, args, trial_cfg, {"stage1": stage1_trial})
+            save_trial_params(trial_dir, args, trial_cfg, {"stage1": stage1_trial}, finetune_run_dir=finetune_run_root)
             stage1_model = run_training(args, stage1_trial, "head", args.pretrain_ckpt)
             stage1_valid_metric = run_predict_eval_metrics_only(
                 py, project_root, eval_args, pkl_dir, split_root, stage1_model, "valid"
@@ -1784,7 +1893,7 @@ def main():
                 "weight_decay": trial_cfg["weight_decay"],
                 "init_base_lr": trial_cfg["init_base_lr"],
                 "optim_type": trial_cfg["optim_type"],
-                "warm_up_epoch": trial_cfg.get("stage2_warmup_epochs", trial_cfg["warm_up_epoch"]),
+                "warm_up_epoch": trial_cfg["stage2_warmup_epochs"],
                 "start_lr": trial_cfg["start_lr"],
                 "lr": trial_cfg["stage2_lr"],
                 "epochs": trial_cfg["stage2_epochs"],
@@ -1793,6 +1902,7 @@ def main():
                 "run_tag": stage2_tag,
                 "log_dir": str(trial_dir / "stage2"),
                 "trial_dir": str(trial_dir),
+                "finetune_run_root": fr_root,
                 "trial_serial": idx,
                 "stage_name": "stage2",
                 "loss_weights": trial_cfg.get("stage2_loss_weights"),
@@ -1815,8 +1925,13 @@ def main():
                 "dist_bar": trial_cfg["dist_bar"],
                 "split_pkl_path": trial_cfg.get("split_pkl_path"),
                 "allow_empty_test": trial_cfg.get("allow_empty_test", False),
+                "early_stop_selection_warmup_epochs": int(
+                    trial_cfg["stage2_early_stop_warmup_epochs"]
+                    if trial_cfg.get("stage2_early_stop_warmup_epochs") is not None
+                    else trial_cfg["stage2_warmup_epochs"]
+                ),
             }
-            save_trial_params(trial_dir, args, trial_cfg, {"stage1": stage1_trial, "stage2": stage2_trial})
+            save_trial_params(trial_dir, args, trial_cfg, {"stage1": stage1_trial, "stage2": stage2_trial}, finetune_run_dir=finetune_run_root)
             stage2_model = run_training(args, stage2_trial, "heads", stage1_model)
             stage2_valid_metric = run_predict_eval_metrics_only(
                 py, project_root, eval_args, pkl_dir, split_root, stage2_model, "valid"
@@ -1841,7 +1956,7 @@ def main():
                 "weight_decay": trial_cfg["weight_decay"],
                 "init_base_lr": trial_cfg["init_base_lr"],
                 "optim_type": trial_cfg["optim_type"],
-                "warm_up_epoch": trial_cfg.get("stage3_warmup_epochs", trial_cfg["warm_up_epoch"]),
+                "warm_up_epoch": trial_cfg["stage3_warmup_epochs"],
                 "start_lr": trial_cfg["start_lr"],
                 "lr": trial_cfg["stage3_lr"],
                 "epochs": trial_cfg["stage3_epochs"],
@@ -1850,6 +1965,7 @@ def main():
                 "run_tag": stage3_tag,
                 "log_dir": str(trial_dir / "stage3"),
                 "trial_dir": str(trial_dir),
+                "finetune_run_root": fr_root,
                 "trial_serial": idx,
                 "stage_name": "stage3",
                 "loss_weights": trial_cfg.get("stage3_loss_weights"),
@@ -1872,12 +1988,18 @@ def main():
                 "dist_bar": trial_cfg["dist_bar"],
                 "split_pkl_path": trial_cfg.get("split_pkl_path"),
                 "allow_empty_test": trial_cfg.get("allow_empty_test", False),
+                "early_stop_selection_warmup_epochs": int(
+                    trial_cfg["stage3_early_stop_warmup_epochs"]
+                    if trial_cfg.get("stage3_early_stop_warmup_epochs") is not None
+                    else trial_cfg["stage3_warmup_epochs"]
+                ),
             }
             save_trial_params(
                 trial_dir,
                 args,
                 trial_cfg,
                 {"stage1": stage1_trial, "stage2": stage2_trial, "stage3": stage3_trial},
+                finetune_run_dir=finetune_run_root,
             )
             candidate_model = run_training(args, stage3_trial, "all", stage2_model)
 
@@ -1896,7 +2018,8 @@ def main():
 
         candidate = {
             "idx": idx,
-            "trial_dir": str(trial_dir),
+            "trial_dir": str(trial_dir.resolve()),
+            "finetune_run_dir": fr_root,
             "run_tag": final_tag,
             "model": str(candidate_model),
             "stage1_run_tag": stage1_tag,
@@ -1912,6 +2035,7 @@ def main():
             "stage2_test": stage2_test_metric,
             "valid": valid_metric,
             "test": test_metric,
+            "completion": "full",
         }
         candidates.append(candidate)
         display_metric_name = primary_name
@@ -1941,18 +2065,20 @@ def main():
     final_metrics, score_json = save_scores(py, project_root, eval_settings(args, best_candidate["params"]), final_weights)
     summary_path = result_dir / f"{args.task}_finetune_search_summary.json"
     score_table_csv = result_dir / f"{args.task}_finetune_3step_score_table.csv"
+    score_table_cleaned_csv = result_dir / f"{args.task}_finetune_3step_score_table_cleaned.csv"
     stage_rows = [row for candidate in candidates for row in build_stage_score_rows(candidate)]
-    pd.DataFrame(stage_rows).to_csv(
-        score_table_csv,
-        index=False,
-    )
+    score_df = pd.DataFrame(stage_rows)
+    score_df.to_csv(score_table_csv, index=False)
+    drop_constant_score_table_columns(score_df).to_csv(score_table_cleaned_csv, index=False)
     with open(summary_path, "w", encoding="utf-8") as f:
         json.dump(
             {
                 "best_candidate": best_candidate,
                 "final_weights": str(final_weights),
                 "final_metrics": final_metrics,
+                "finetune_run_dir": fr_root,
                 "score_table_csv": str(score_table_csv),
+                "score_table_cleaned_csv": str(score_table_cleaned_csv),
                 "candidates": candidates,
             },
             f,
@@ -1961,10 +2087,12 @@ def main():
         )
 
     print("\n=== Three-step Finetune Completed ===")
+    print(f"Finetune run directory: {finetune_run_root}")
     print(f"Best model: {best_model}")
     print(f"Final weights: {final_weights}")
     print(f"Score JSON: {score_json}")
     print(f"Score table CSV: {score_table_csv}")
+    print(f"Cleaned score table CSV: {score_table_cleaned_csv}")
     print(f"Search summary: {summary_path}")
 
 

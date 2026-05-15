@@ -1,7 +1,8 @@
 """
 Offline aggregate for brute-force MPP finetune search.
 
-Scans finetune_result/*/trial_params.yaml, detects completed checkpoints, optionally
+Scans finetune_result/**/trial_params.yaml (each run session under finetune_result/<run>/…,
+or legacy finetune_result/<trial>/trial_params.yaml), detects completed checkpoints, optionally
 re-runs predict_mpp eval (same as the main pipeline), and writes *_partial.csv tables.
 
 Docker（建議在容器內執行，勿在本機改動映像外環境）
@@ -57,8 +58,8 @@ def parse_args() -> argparse.Namespace:
     p.add_argument(
         "--finetune_glob",
         type=str,
-        default="finetune_result/*/trial_params.yaml",
-        help="Glob pattern relative to project_root for trial_params.yaml files",
+        default="finetune_result/**/trial_params.yaml",
+        help="Glob pattern relative to project_root for trial_params.yaml (recursive; matches per-run subfolders)",
     )
     p.add_argument("--result_dir", type=str, default="./outputs/caco2_pipeline")
     p.add_argument("--task", type=str, default="caco2")

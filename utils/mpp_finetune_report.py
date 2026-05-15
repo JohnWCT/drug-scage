@@ -73,6 +73,8 @@ def _json_or_none(value: Any) -> Optional[str]:
 
 
 def _hidden_param_columns(params: Dict[str, Any]) -> Dict[str, Any]:
+    reweight = bool(params.get("graph_label_reweight", False))
+    winsor_active = params.get("regression_label_transform", "none") == "winsorized_standardize"
     return {
         "split_pkl_path": params.get("split_pkl_path"),
         "allow_empty_test": params.get("allow_empty_test"),
@@ -82,16 +84,22 @@ def _hidden_param_columns(params: Dict[str, Any]) -> Dict[str, Any]:
         "mt_loss_tau": params.get("mt_loss_tau"),
         "mt_ratio_clip": params.get("mt_ratio_clip"),
         "mt_loss_prior": _json_or_none(params.get("mt_loss_prior")),
-        "winsorize_quantile_low": params.get("winsorize_quantile_low"),
-        "winsorize_quantile_high": params.get("winsorize_quantile_high"),
+        "winsorize_quantile_low": params.get("winsorize_quantile_low") if winsor_active else None,
+        "winsorize_quantile_high": params.get("winsorize_quantile_high") if winsor_active else None,
         "graph_label_reweight": params.get("graph_label_reweight"),
-        "graph_label_bins": _json_or_none(params.get("graph_label_bins")),
-        "graph_label_weight_power": params.get("graph_label_weight_power"),
-        "graph_label_weight_clip": params.get("graph_label_weight_clip"),
+        "graph_label_bins": _json_or_none(params.get("graph_label_bins")) if reweight else None,
+        "graph_label_weight_power": params.get("graph_label_weight_power") if reweight else None,
+        "graph_label_weight_clip": params.get("graph_label_weight_clip") if reweight else None,
         "warm_up_epoch": params.get("warm_up_epoch"),
         "init_base_lr": params.get("init_base_lr"),
         "optim_type": params.get("optim_type"),
+        "scheduler_type": params.get("scheduler_type"),
         "start_lr": params.get("start_lr"),
+        "embedding_dim": params.get("embedding_dim"),
+        "hidden_dim": params.get("hidden_dim"),
+        "layer_num": params.get("layer_num"),
+        "num_heads": params.get("num_heads"),
+        "stage1_warmup_epochs": params.get("stage1_warmup_epochs"),
         "stage2_warmup_epochs": params.get("stage2_warmup_epochs"),
         "stage3_warmup_epochs": params.get("stage3_warmup_epochs"),
         "stage1_loss_weights": _json_or_none(params.get("stage1_loss_weights")),
